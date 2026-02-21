@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 import numpy as np
@@ -9,8 +8,9 @@ from flask import Blueprint, jsonify, make_response, request
 from backend.api.auth_utils import get_user_from_request
 from backend.globals import db
 from backend.ml.disturbance import apply_basic_disturbance, build_advanced_future_features
+from backend.ml.evaluation import evaluate_history, physical_metrics
 from backend.ml.piml_correction import apply_physics_corrections
-from backend.utils.data_validator import validate_disturbance, validate_horizon
+from backend.utils.data_validator import validate_disturbance, validate_evaluation, validate_horizon
 
 predictions_blueprint = Blueprint("predictions_blueprint", __name__)
 
@@ -20,7 +20,7 @@ def _detect_mode_from_upload(upload: Dict[str, Any]) -> str:
     return "advanced" if len(feature_cols) > 0 else "basic"
 
 
-def _parse_predict_payload() -> Tuple[str, int, str | None, Dict[str, Any], Dict[str, Any] | None]:
+def _parse_predict_payload() -> Tuple[str, int, str | None, Dict[str, Any], Dict[str, Any] | None, Dict[str, Any] | None]:
     payload = request.get_json(silent=True) or {}
     upload_id = payload.get("upload_id")
     if not upload_id:
@@ -66,7 +66,9 @@ def _parse_predict_payload() -> Tuple[str, int, str | None, Dict[str, Any], Dict
     }
 
     disturbance = payload.get("disturbance")
-    return upload_id, horizon, mode_override, physics_params, disturbance
+    evaluation = payload.get("evaluation")
+
+    return upload_id, horizon, mode_override, physics_params, disturbance, evaluation
 
 
 def _month_add(iso_date: str, k: int) -> str:
@@ -87,17 +89,16 @@ def _basic_predict_monthly(points: List[Dict[str, Any]], horizon: int) -> List[D
 
     out: List[Dict[str, Any]] = []
     for i in range(n):
-        out.append({"date": points[i]["date"], "value": fitted[i], "kind": "fitted"})
+        out.append({"date": points[i]["date"], "value": float(fitted[i]), "kind": "fitted"})
     for i in range(horizon):
-        out.append({"date": future_dates[i], "value": future_y[i], "kind": "forecast"})
+        out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
     return out
 
 
-def _advanced_fit(points: List[Dict[str, Any]], feature_cols: List[str]) -> Tuple[np.ndarray, List[str], np.ndarray, np.ndarray]:
+def _advanced_fit(points: List[Dict[str, Any]], feature_cols: List[str]) -> Tuple[np.ndarray, List[str], np.ndarray]:
     X_rows: List[List[float]] = []
     y_vals: List[float] = []
     dates: List[str] = []
-
     for p in points:
         feats = p.get("features", {}) or {}
         row: List[float] = []
@@ -127,11 +128,11 @@ def _advanced_fit(points: List[Dict[str, Any]], feature_cols: List[str]) -> Tupl
     Xb = np.hstack([np.ones((X.shape[0], 1), dtype=float), X])
     w, *_ = np.linalg.lstsq(Xb, y, rcond=None)
 
-    return w, dates, X, y
+    return w, dates, X
 
 
 def _advanced_predict_monthly(points: List[Dict[str, Any]], feature_cols: List[str], horizon: int) -> List[Dict[str, Any]]:
-    w, dates, X, _y = _advanced_fit(points, feature_cols)
+    w, dates, X = _advanced_fit(points, feature_cols)
     Xb = np.hstack([np.ones((X.shape[0], 1), dtype=float), X])
     y_hat = (Xb @ w).tolist()
     last_feats = X[-1, :]
@@ -143,9 +144,9 @@ def _advanced_predict_monthly(points: List[Dict[str, Any]], feature_cols: List[s
 
     out: List[Dict[str, Any]] = []
     for i, d in enumerate(dates):
-        out.append({"date": d, "value": y_hat[i], "kind": "fitted"})
+        out.append({"date": d, "value": float(y_hat[i]), "kind": "fitted"})
     for i in range(horizon):
-        out.append({"date": future_dates[i], "value": future_y[i], "kind": "forecast"})
+        out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
     return out
 
 
@@ -155,12 +156,9 @@ def _advanced_predict_monthly_with_future_features(
     horizon: int,
     future_features: Dict[str, float],
 ) -> List[Dict[str, Any]]:
-    w, dates, X, _y = _advanced_fit(points, feature_cols)
-
+    w, dates, X = _advanced_fit(points, feature_cols)
     Xb = np.hstack([np.ones((X.shape[0], 1), dtype=float), X])
     y_hat = (Xb @ w).tolist()
-
-    # Use provided future feature vector; fall back to last known for missing entries.
     last_feats = X[-1, :].copy()
     for i, col in enumerate(feature_cols):
         if col in future_features:
@@ -174,9 +172,9 @@ def _advanced_predict_monthly_with_future_features(
 
     out: List[Dict[str, Any]] = []
     for i, d in enumerate(dates):
-        out.append({"date": d, "value": y_hat[i], "kind": "fitted"})
+        out.append({"date": d, "value": float(y_hat[i]), "kind": "fitted"})
     for i in range(horizon):
-        out.append({"date": future_dates[i], "value": future_y[i], "kind": "forecast"})
+        out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
     return out
 
 
@@ -215,7 +213,7 @@ def create_prediction():
         return make_response(jsonify({"error": str(e)}), 401)
 
     try:
-        upload_id, horizon, mode_override, physics_params, disturbance_raw = _parse_predict_payload()
+        upload_id, horizon, mode_override, physics_params, disturbance_raw, evaluation_raw = _parse_predict_payload()
     except ValueError as e:
         return make_response(jsonify({"error": str(e)}), 400)
 
@@ -256,15 +254,14 @@ def create_prediction():
         return make_response(jsonify({"error": "Failed to parse upload data.", "details": str(e)}), 500)
 
     try:
-        disturbance = validate_disturbance(
-            disturbance_raw,
-            mode_used=mode_used,
-            feature_cols=feature_cols,
-        )
+        disturbance = validate_disturbance(disturbance_raw, mode_used=mode_used, feature_cols=feature_cols)
+        evaluation = validate_evaluation(evaluation_raw, n_points=len(points_sorted))
     except ValueError as e:
         return make_response(jsonify({"error": str(e)}), 400)
 
-    # Original baseline 
+    observed = [{"date": p["date"], "value": float(p["y"]), "kind": "observed"} for p in points_sorted]
+
+    # Original baseline
     try:
         if mode_used == "basic":
             baseline_original = _basic_predict_monthly(points_sorted, horizon)
@@ -277,7 +274,7 @@ def create_prediction():
     except Exception as e:
         return make_response(jsonify({"error": "Model fit/predict failed.", "details": str(e)}), 500)
 
-    # Original physics (optional, but safe even when mode=none) 
+    # Original physics
     try:
         piml_original, correction_original, comparison_original = _run_physics(baseline_original, physics_params)
     except ValueError as e:
@@ -285,18 +282,56 @@ def create_prediction():
     except Exception as e:
         return make_response(jsonify({"error": "PIML correction failed.", "details": str(e)}), 500)
 
+    prev_anchor = float(points_sorted[-1]["y"])
+
+    original_physics = {
+        "baseline": physical_metrics(
+            baseline_original,
+            non_negative=bool(physics_params["non_negative"]),
+            max_change_rate=float(physics_params["max_change_rate"]),
+            cap_value=physics_params["cap_value"],
+            prev_value=prev_anchor,
+            correction_summary=None,
+        ),
+        "piml": physical_metrics(
+            piml_original,
+            non_negative=bool(physics_params["non_negative"]),
+            max_change_rate=float(physics_params["max_change_rate"]),
+            cap_value=physics_params["cap_value"],
+            prev_value=prev_anchor,
+            correction_summary=correction_original,
+        ),
+    }
+
     outputs: Dict[str, Any] = {
+        "observed": observed,
         "original": {
             "baseline": baseline_original,
             "piml": piml_original,
             "comparison": comparison_original,
             "correction_summary": correction_original,
-        }
+            "physics": original_physics,
+        },
     }
+
+    evaluation_out: Dict[str, Any] | None = None
+    if evaluation.get("enabled") and evaluation.get("split"):
+        try:
+            evaluation_out = evaluate_history(
+                points_sorted=points_sorted,
+                mode_used=mode_used,
+                feature_cols=feature_cols,
+                split_cfg=evaluation["split"],
+                physics_params=physics_params,
+                apply_physics_fn=apply_physics_corrections,
+            )
+        except ValueError as e:
+            return make_response(jsonify({"error": str(e)}), 400)
+        except Exception as e:
+            return make_response(jsonify({"error": "Evaluation failed.", "details": str(e)}), 500)
 
     disturbance_summary: Dict[str, Any] | None = None
 
-    # Disturbed branch (if enabled)
     if disturbance["enabled"]:
         try:
             if mode_used == "basic":
@@ -323,12 +358,31 @@ def create_prediction():
                 )
 
             piml_disturbed, correction_disturbed, comparison_disturbed = _run_physics(baseline_disturbed, physics_params)
+            disturbed_physics = {
+                "baseline": physical_metrics(
+                    baseline_disturbed,
+                    non_negative=bool(physics_params["non_negative"]),
+                    max_change_rate=float(physics_params["max_change_rate"]),
+                    cap_value=physics_params["cap_value"],
+                    prev_value=prev_anchor,
+                    correction_summary=None,
+                ),
+                "piml": physical_metrics(
+                    piml_disturbed,
+                    non_negative=bool(physics_params["non_negative"]),
+                    max_change_rate=float(physics_params["max_change_rate"]),
+                    cap_value=physics_params["cap_value"],
+                    prev_value=prev_anchor,
+                    correction_summary=correction_disturbed,
+                ),
+            }
 
             outputs["disturbed"] = {
                 "baseline": baseline_disturbed,
                 "piml": piml_disturbed,
                 "comparison": comparison_disturbed,
                 "correction_summary": correction_disturbed,
+                "physics": disturbed_physics,
             }
 
         except ValueError as e:
@@ -349,8 +403,10 @@ def create_prediction():
             "mode_override": mode_override,
             "physics": physics_params,
             "disturbance": disturbance,
+            "evaluation": evaluation,
         },
         "outputs": outputs,
+        "evaluation": evaluation_out,
         "disturbance_summary": disturbance_summary,
         "limitations": [
             "Advanced baseline uses the last feature vector for forecasting; disturbance applies to that future feature vector.",
@@ -366,7 +422,6 @@ def create_prediction():
     except Exception as e:
         return make_response(jsonify({"error": "Failed to save prediction record.", "details": str(e)}), 500)
 
-    # Keep a few top-level fields for simple clients, plus the structured outputs.
     resp = {
         "message": "Prediction created.",
         "prediction_id": str(ins.inserted_id),
@@ -377,6 +432,7 @@ def create_prediction():
         "method": method,
         "params": record["params"],
         "outputs": outputs,
+        "evaluation": evaluation_out,
         "disturbance_summary": disturbance_summary,
         "limitations": record["limitations"],
         # Back-compat:
@@ -412,6 +468,7 @@ def get_prediction(prediction_id: str):
                     "method": doc.get("method"),
                     "params": doc.get("params"),
                     "outputs": doc.get("outputs"),
+                    "evaluation": doc.get("evaluation"),
                     "disturbance_summary": doc.get("disturbance_summary"),
                     "limitations": doc.get("limitations", []),
                     "created_at": doc.get("created_at").isoformat() if doc.get("created_at") else None,

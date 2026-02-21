@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Carbon PIML Platform – Results</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+
+  <body data-page="results">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand__title">Carbon PIML Platform</div>
+        <div class="brand__subtitle">Results (Baseline vs PIML)</div>
+      </div>
+
+      <nav class="topbar__actions">
+        <a class="btn btn--ghost" href="./index.html">Setup</a>
+        <a class="btn btn--ghost" href="./results.html">Results</a>
+      </nav>
+    </header>
+
+    <main class="container">
+      <section class="page">
+        <div class="grid grid--2">
+          <div class="card">
+            <div class="card__title">Key numbers</div>
+            <div class="card__hint">History evaluation uses a holdout split (only where ground truth exists).</div>
+
+            <div class="kpis">
+              <div class="kpi">
+                <div class="kpi__label">Baseline error (holdout)</div>
+                <div class="kpi__value" id="kpiBaseErr">—</div>
+                <div class="kpi__sub">RMSE / MAE / MAPE</div>
+              </div>
+
+              <div class="kpi">
+                <div class="kpi__label">PIML error (holdout)</div>
+                <div class="kpi__value" id="kpiPimlErr">—</div>
+                <div class="kpi__sub">RMSE / MAE / MAPE</div>
+              </div>
+
+              <div class="kpi">
+                <div class="kpi__label">Improvement (RMSE)</div>
+                <div class="kpi__value" id="kpiImprove">—</div>
+                <div class="kpi__sub">((base - piml) / base) × 100</div>
+              </div>
+
+              <div class="kpi">
+                <div class="kpi__label">Physics violations (forecast)</div>
+                <div class="kpi__value" id="kpiPhys">—</div>
+                <div class="kpi__sub">counts in selected view</div>
+              </div>
+            </div>
+
+            <div class="status" style="margin-top: 12px;">
+              <div><span class="label">Prediction ID:</span> <span id="pidBox">—</span></div>
+              <div><span class="label">Mode:</span> <span id="modeBox">—</span></div>
+              <div><span class="label">Method:</span> <span id="methodBox">—</span></div>
+            </div>
+
+            <details class="details">
+              <summary>Show raw response</summary>
+              <pre id="rawBox" class="codebox">—</pre>
+            </details>
+
+            <div class="row row--end">
+              <button id="exportJsonBtn" class="btn btn--ghost" type="button">Export JSON</button>
+              <button id="exportCsvBtn" class="btn btn--ghost" type="button">Export CSV</button>
+            </div>
+
+            <div id="resultsStatus" class="runStatus" style="margin-top: 10px;">—</div>
+          </div>
+
+          <div class="card">
+            <div class="card__title">Chart</div>
+            <div class="card__hint">Observed vs Baseline vs PIML. Switch view if you enabled disturbance.</div>
+
+            <div class="row row--tight">
+              <label class="field field--inline">
+                <span class="field__label">View:</span>
+                <select id="viewSelect" class="input input--sm">
+                  <option value="original" selected>original</option>
+                  <option value="disturbed">disturbed</option>
+                </select>
+              </label>
+              <div class="spacer"></div>
+              <button id="refreshBtn" class="btn btn--ghost" type="button">Refresh</button>
+            </div>
+
+            <canvas id="chart" width="900" height="420" class="chart"></canvas>
+
+            <div class="legend">
+              <span class="dot dot--a"></span><span>Observed</span>
+              <span class="dot dot--b"></span><span>Baseline</span>
+              <span class="dot dot--c"></span><span>PIML</span>
+            </div>
+          </div>
+        </div>
+
+        <footer class="footer">
+          <span>Tip: run again from Setup to generate a new prediction id.</span>
+        </footer>
+      </section>
+    </main>
+
+    <script src="./config.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

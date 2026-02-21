@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Carbon PIML Platform</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+
+  <body data-page="setup">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand__title">Carbon PIML Platform</div>
+        <div class="brand__subtitle">Upload data, set scenario, compare Baseline vs PIML.</div>
+      </div>
+
+      <nav class="topbar__actions">
+        <a class="btn btn--ghost" href="./index.html">Setup</a>
+        <a class="btn btn--ghost" href="./results.html">Results</a>
+      </nav>
+    </header>
+
+    <main class="container">
+      <section class="page">
+        <div class="grid grid--2">
+          <div class="card">
+            <div class="card__title">1) Upload CSV</div>
+            <div class="card__hint">First column: date/time. Last column: emission value. Middle columns: optional features.</div>
+
+            <div class="row">
+              <input id="fileInput" class="input" type="file" accept=".csv" />
+              <button id="uploadBtn" class="btn btn--primary" type="button">Upload</button>
+            </div>
+
+            <div class="status">
+              <div><span class="label">Upload:</span> <span id="uploadStatus">No file uploaded.</span></div>
+              <div><span class="label">Mode:</span> <span id="modeStatus">—</span></div>
+              <div><span class="label">Scale:</span> <span id="scaleStatus">—</span></div>
+            </div>
+
+            <details class="details">
+              <summary>Show detected schema</summary>
+              <pre id="schemaBox" class="codebox">—</pre>
+            </details>
+          </div>
+
+          <div class="card">
+            <div class="card__title">2) Scenario settings</div>
+
+            <div class="form">
+              <label class="field">
+                <span class="field__label">Scenario name (optional)</span>
+                <input id="scenarioName" class="input" type="text" placeholder="e.g. lockdown or fuel switch" />
+              </label>
+
+              <label class="field">
+                <span class="field__label">Forecast horizon</span>
+                <select id="horizonSelect" class="input">
+                  <option value="3">3 months</option>
+                  <option value="6">6 months</option>
+                  <option value="12" selected>12 months</option>
+                  <option value="24">24 months</option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span class="field__label">Physics mode (post-processing)</span>
+                <select id="physicsMode" class="input">
+                  <option value="none">none</option>
+                  <option value="non_negative">non_negative</option>
+                  <option value="smoothness">smoothness</option>
+                  <option value="cap">cap</option>
+                  <option value="full" selected>full</option>
+                </select>
+              </label>
+
+              <div class="row row--tight">
+                <label class="field field--inline">
+                  <input id="nonNegativeToggle" type="checkbox" checked />
+                  <span>Enforce non-negative</span>
+                </label>
+              </div>
+
+              <div class="grid grid--2 grid--gap">
+                <label class="field">
+                  <span class="field__label">Max change rate (smoothness)</span>
+                  <input id="maxChangeRate" class="input" type="number" step="0.01" min="0" max="2" value="0.25" />
+                </label>
+
+                <label class="field">
+                  <span class="field__label">Cap value (optional)</span>
+                  <input id="capValue" class="input" type="number" step="0.01" placeholder="leave empty if not used" />
+                </label>
+              </div>
+
+              <hr class="sep" />
+
+              <div class="row row--tight">
+                <label class="field field--inline">
+                  <input id="disturbEnabled" type="checkbox" />
+                  <span>Enable disturbance (what-if)</span>
+                </label>
+              </div>
+
+              <div id="disturbPanel" class="disturb disabled">
+                <div class="disturb__hint">
+                  Upload first to detect mode. Basic mode uses one slider. Advanced mode uses per-feature sliders.
+                </div>
+
+                <div id="basicDisturb" class="hidden">
+                  <div class="sliderRow">
+                    <div class="sliderRow__label">Global change (%)</div>
+                    <input id="globalPct" type="range" min="-20" max="20" value="0" />
+                    <div class="sliderRow__value"><span id="globalPctVal">0</span>%</div>
+                  </div>
+
+                  <label class="field">
+                    <span class="field__label">Or type value (%)</span>
+                    <input id="globalPctInput" class="input" type="number" step="0.1" min="-95" max="200" value="0" />
+                  </label>
+                </div>
+
+                <div id="advancedDisturb" class="hidden">
+                  <div id="featureSliders" class="featureSliders"></div>
+                </div>
+              </div>
+
+              <hr class="sep" />
+
+              <div class="row row--tight">
+                <label class="field field--inline">
+                  <input id="evalEnabled" type="checkbox" checked />
+                  <span>Evaluate on history (holdout)</span>
+                </label>
+              </div>
+
+              <div id="evalPanel" class="grid grid--2 grid--gap">
+                <label class="field">
+                  <span class="field__label">Split mode</span>
+                  <select id="evalMode" class="input">
+                    <option value="ratio" selected>ratio (last 20%)</option>
+                    <option value="last12">last K points</option>
+                  </select>
+                </label>
+
+                <label class="field">
+                  <span class="field__label">K points (used when last K)</span>
+                  <input id="evalK" class="input" type="number" step="1" min="2" value="12" />
+                </label>
+              </div>
+
+              <div class="row row--end">
+                <button id="resetBtn" class="btn btn--ghost" type="button">Reset</button>
+                <button id="runBtn" class="btn btn--primary" type="button">Run</button>
+              </div>
+
+              <div id="runStatus" class="runStatus">Ready.</div>
+            </div>
+          </div>
+        </div>
+
+        <footer class="footer">
+          <span>Local demo for COM668 (Baseline vs PIML). Disturbance is what-if only.</span>
+        </footer>
+      </section>
+    </main>
+
+    <script src="./config.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
