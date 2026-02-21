@@ -17,7 +17,7 @@ def create_app() -> Flask:
         allow_headers=["Content-Type", "Authorization"],
         expose_headers=["Content-Type"],
     )
-
+  
     app.register_blueprint(uploads_blueprint, url_prefix="/api")
     app.register_blueprint(predictions_blueprint, url_prefix="/api")
 

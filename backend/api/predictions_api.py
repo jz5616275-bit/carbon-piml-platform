@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 import numpy as np
@@ -7,8 +8,10 @@ from dateutil.relativedelta import relativedelta
 from flask import Blueprint, jsonify, make_response, request
 from backend.api.auth_utils import get_user_from_request
 from backend.globals import db
+from backend.ml.disturbance import apply_basic_disturbance, build_advanced_future_features
 from backend.ml.piml_correction import apply_physics_corrections
-from backend.utils.data_validator import validate_horizon
+from backend.utils.data_validator import validate_disturbance, validate_horizon
+
 predictions_blueprint = Blueprint("predictions_blueprint", __name__)
 
 
@@ -17,7 +20,7 @@ def _detect_mode_from_upload(upload: Dict[str, Any]) -> str:
     return "advanced" if len(feature_cols) > 0 else "basic"
 
 
-def _parse_predict_payload() -> Tuple[str, int, str | None, Dict[str, Any]]:
+def _parse_predict_payload() -> Tuple[str, int, str | None, Dict[str, Any], Dict[str, Any] | None]:
     payload = request.get_json(silent=True) or {}
     upload_id = payload.get("upload_id")
     if not upload_id:
@@ -62,7 +65,8 @@ def _parse_predict_payload() -> Tuple[str, int, str | None, Dict[str, Any]]:
         "cap_value": cap_value,
     }
 
-    return upload_id, horizon, mode_override, physics_params
+    disturbance = payload.get("disturbance")
+    return upload_id, horizon, mode_override, physics_params, disturbance
 
 
 def _month_add(iso_date: str, k: int) -> str:
@@ -80,6 +84,7 @@ def _basic_predict_monthly(points: List[Dict[str, Any]], horizon: int) -> List[D
     future_y = (a * future_x + b).tolist()
     last_date = points[-1]["date"]
     future_dates = [_month_add(last_date, i) for i in range(1, horizon + 1)]
+
     out: List[Dict[str, Any]] = []
     for i in range(n):
         out.append({"date": points[i]["date"], "value": fitted[i], "kind": "fitted"})
@@ -88,14 +93,14 @@ def _basic_predict_monthly(points: List[Dict[str, Any]], horizon: int) -> List[D
     return out
 
 
-def _advanced_predict_monthly(points: List[Dict[str, Any]], feature_cols: List[str], horizon: int) -> List[Dict[str, Any]]:
-    X_rows = []
-    y_vals = []
-    dates = []
+def _advanced_fit(points: List[Dict[str, Any]], feature_cols: List[str]) -> Tuple[np.ndarray, List[str], np.ndarray, np.ndarray]:
+    X_rows: List[List[float]] = []
+    y_vals: List[float] = []
+    dates: List[str] = []
 
     for p in points:
         feats = p.get("features", {}) or {}
-        row = []
+        row: List[float] = []
         valid = True
         for col in feature_cols:
             v = feats.get(col)
@@ -121,6 +126,13 @@ def _advanced_predict_monthly(points: List[Dict[str, Any]], feature_cols: List[s
     y = np.array(y_vals, dtype=float)
     Xb = np.hstack([np.ones((X.shape[0], 1), dtype=float), X])
     w, *_ = np.linalg.lstsq(Xb, y, rcond=None)
+
+    return w, dates, X, y
+
+
+def _advanced_predict_monthly(points: List[Dict[str, Any]], feature_cols: List[str], horizon: int) -> List[Dict[str, Any]]:
+    w, dates, X, _y = _advanced_fit(points, feature_cols)
+    Xb = np.hstack([np.ones((X.shape[0], 1), dtype=float), X])
     y_hat = (Xb @ w).tolist()
     last_feats = X[-1, :]
     future_X = np.tile(last_feats, (horizon, 1))
@@ -128,6 +140,38 @@ def _advanced_predict_monthly(points: List[Dict[str, Any]], feature_cols: List[s
     future_y = (future_Xb @ w).tolist()
     last_date = dates[-1]
     future_dates = [_month_add(last_date, i) for i in range(1, horizon + 1)]
+
+    out: List[Dict[str, Any]] = []
+    for i, d in enumerate(dates):
+        out.append({"date": d, "value": y_hat[i], "kind": "fitted"})
+    for i in range(horizon):
+        out.append({"date": future_dates[i], "value": future_y[i], "kind": "forecast"})
+    return out
+
+
+def _advanced_predict_monthly_with_future_features(
+    points: List[Dict[str, Any]],
+    feature_cols: List[str],
+    horizon: int,
+    future_features: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    w, dates, X, _y = _advanced_fit(points, feature_cols)
+
+    Xb = np.hstack([np.ones((X.shape[0], 1), dtype=float), X])
+    y_hat = (Xb @ w).tolist()
+
+    # Use provided future feature vector; fall back to last known for missing entries.
+    last_feats = X[-1, :].copy()
+    for i, col in enumerate(feature_cols):
+        if col in future_features:
+            last_feats[i] = float(future_features[col])
+
+    future_X = np.tile(last_feats, (horizon, 1))
+    future_Xb = np.hstack([np.ones((horizon, 1), dtype=float), future_X])
+    future_y = (future_Xb @ w).tolist()
+    last_date = dates[-1]
+    future_dates = [_month_add(last_date, i) for i in range(1, horizon + 1)]
+
     out: List[Dict[str, Any]] = []
     for i, d in enumerate(dates):
         out.append({"date": d, "value": y_hat[i], "kind": "fitted"})
@@ -145,8 +189,22 @@ def _compute_comparison(baseline: List[Dict[str, Any]], piml: List[Dict[str, Any
     max_abs = float(max(diffs)) if diffs else 0.0
     changed = sum(1 for b, p in zip(baseline, piml) if float(b["value"]) != float(p["value"]))
     ratio = float(changed) / float(len(piml)) if piml else 0.0
-
     return {"mean_abs_adjustment": mean_abs, "max_abs_adjustment": max_abs, "adjusted_ratio": ratio}
+
+
+def _run_physics(
+    baseline: List[Dict[str, Any]],
+    physics_params: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+    piml, correction_summary = apply_physics_corrections(
+        baseline,
+        physics_mode=physics_params["physics_mode"],
+        non_negative=physics_params["non_negative"],
+        max_change_rate=physics_params["max_change_rate"],
+        cap_value=physics_params["cap_value"],
+    )
+    comparison = _compute_comparison(baseline, piml)
+    return piml, correction_summary, comparison
 
 
 @predictions_blueprint.route("/predict", methods=["POST"])
@@ -157,7 +215,7 @@ def create_prediction():
         return make_response(jsonify({"error": str(e)}), 401)
 
     try:
-        upload_id, horizon, mode_override, physics_params = _parse_predict_payload()
+        upload_id, horizon, mode_override, physics_params, disturbance_raw = _parse_predict_payload()
     except ValueError as e:
         return make_response(jsonify({"error": str(e)}), 400)
 
@@ -179,6 +237,7 @@ def create_prediction():
         )
 
     mode_used = mode_override if mode_override is not None else mode_detected
+
     points = upload.get("data", []) or []
     if len(points) < 2:
         return make_response(jsonify({"error": "Not enough data points to predict."}), 400)
@@ -197,31 +256,85 @@ def create_prediction():
         return make_response(jsonify({"error": "Failed to parse upload data.", "details": str(e)}), 500)
 
     try:
+        disturbance = validate_disturbance(
+            disturbance_raw,
+            mode_used=mode_used,
+            feature_cols=feature_cols,
+        )
+    except ValueError as e:
+        return make_response(jsonify({"error": str(e)}), 400)
+
+    # Original baseline 
+    try:
         if mode_used == "basic":
-            baseline = _basic_predict_monthly(points_sorted, horizon)
+            baseline_original = _basic_predict_monthly(points_sorted, horizon)
             method = "baseline_basic_time_trend_monthly"
         else:
-            baseline = _advanced_predict_monthly(points_sorted, feature_cols, horizon)
+            baseline_original = _advanced_predict_monthly(points_sorted, feature_cols, horizon)
             method = "baseline_advanced_linear_regression_monthly"
     except ValueError as e:
         return make_response(jsonify({"error": str(e)}), 400)
     except Exception as e:
         return make_response(jsonify({"error": "Model fit/predict failed.", "details": str(e)}), 500)
 
+    # Original physics (optional, but safe even when mode=none) 
     try:
-        piml, correction_summary = apply_physics_corrections(
-            baseline,
-            physics_mode=physics_params["physics_mode"],
-            non_negative=physics_params["non_negative"],
-            max_change_rate=physics_params["max_change_rate"],
-            cap_value=physics_params["cap_value"],
-        )
+        piml_original, correction_original, comparison_original = _run_physics(baseline_original, physics_params)
     except ValueError as e:
         return make_response(jsonify({"error": str(e)}), 400)
     except Exception as e:
         return make_response(jsonify({"error": "PIML correction failed.", "details": str(e)}), 500)
 
-    comparison = _compute_comparison(baseline, piml)
+    outputs: Dict[str, Any] = {
+        "original": {
+            "baseline": baseline_original,
+            "piml": piml_original,
+            "comparison": comparison_original,
+            "correction_summary": correction_original,
+        }
+    }
+
+    disturbance_summary: Dict[str, Any] | None = None
+
+    # Disturbed branch (if enabled)
+    if disturbance["enabled"]:
+        try:
+            if mode_used == "basic":
+                disturbed_points = apply_basic_disturbance(points_sorted, float(disturbance["global_pct"] or 0.0))
+                baseline_disturbed = _basic_predict_monthly(disturbed_points, horizon)
+                disturbance_summary = {
+                    "enabled": True,
+                    "mode": "basic",
+                    "global_pct": float(disturbance["global_pct"] or 0.0),
+                }
+            else:
+                last_feats = points_sorted[-1].get("features", {}) or {}
+                future_feats, disturbance_summary = build_advanced_future_features(
+                    last_features=last_feats,
+                    feature_cols=feature_cols,
+                    feature_pct=disturbance["feature_pct"] or {},
+                )
+                disturbance_summary["enabled"] = True
+                baseline_disturbed = _advanced_predict_monthly_with_future_features(
+                    points_sorted,
+                    feature_cols,
+                    horizon,
+                    future_features=future_feats,
+                )
+
+            piml_disturbed, correction_disturbed, comparison_disturbed = _run_physics(baseline_disturbed, physics_params)
+
+            outputs["disturbed"] = {
+                "baseline": baseline_disturbed,
+                "piml": piml_disturbed,
+                "comparison": comparison_disturbed,
+                "correction_summary": correction_disturbed,
+            }
+
+        except ValueError as e:
+            return make_response(jsonify({"error": str(e)}), 400)
+        except Exception as e:
+            return make_response(jsonify({"error": "Disturbance pipeline failed.", "details": str(e)}), 500)
 
     record = {
         "upload_id": ObjectId(upload_id),
@@ -231,17 +344,19 @@ def create_prediction():
         "mode_detected": mode_detected,
         "mode_used": mode_used,
         "method": method,
-        "params": {"horizon_months": horizon, "mode_override": mode_override, "physics": physics_params},
-        "outputs": {
-            "baseline": baseline,
-            "piml": piml,
-            "comparison": comparison,
-            "correction_summary": correction_summary,
+        "params": {
+            "horizon_months": horizon,
+            "mode_override": mode_override,
+            "physics": physics_params,
+            "disturbance": disturbance,
         },
+        "outputs": outputs,
+        "disturbance_summary": disturbance_summary,
         "limitations": [
-            "Advanced baseline holds the last feature vector constant for forecasting.",
+            "Advanced baseline uses the last feature vector for forecasting; disturbance applies to that future feature vector.",
             "Yearly data is rejected; daily data is resampled to monthly.",
-            "PIML is implemented as a user-selectable post-processing correction layer (not retraining the baseline).",
+            "PIML is implemented as a post-processing correction layer (no retraining).",
+            "Disturbed scenarios are for what-if comparison, not accuracy scoring (no ground truth).",
         ],
     }
 
@@ -251,26 +366,27 @@ def create_prediction():
     except Exception as e:
         return make_response(jsonify({"error": "Failed to save prediction record.", "details": str(e)}), 500)
 
-    return make_response(
-        jsonify(
-            {
-                "message": "Prediction created.",
-                "prediction_id": str(ins.inserted_id),
-                "upload_id": upload_id,
-                "scale_used": record["scale_used"],
-                "mode_detected": mode_detected,
-                "mode_used": mode_used,
-                "method": method,
-                "params": record["params"],
-                "baseline": baseline,
-                "piml": piml,
-                "comparison": comparison,
-                "correction_summary": correction_summary,
-                "limitations": record["limitations"],
-            }
-        ),
-        201,
-    )
+    # Keep a few top-level fields for simple clients, plus the structured outputs.
+    resp = {
+        "message": "Prediction created.",
+        "prediction_id": str(ins.inserted_id),
+        "upload_id": upload_id,
+        "scale_used": record["scale_used"],
+        "mode_detected": mode_detected,
+        "mode_used": mode_used,
+        "method": method,
+        "params": record["params"],
+        "outputs": outputs,
+        "disturbance_summary": disturbance_summary,
+        "limitations": record["limitations"],
+        # Back-compat:
+        "baseline": outputs["original"]["baseline"],
+        "piml": outputs["original"]["piml"],
+        "comparison": outputs["original"]["comparison"],
+        "correction_summary": outputs["original"]["correction_summary"],
+    }
+
+    return make_response(jsonify(resp), 201)
 
 
 @predictions_blueprint.route("/predictions/<prediction_id>", methods=["GET"])
@@ -296,6 +412,7 @@ def get_prediction(prediction_id: str):
                     "method": doc.get("method"),
                     "params": doc.get("params"),
                     "outputs": doc.get("outputs"),
+                    "disturbance_summary": doc.get("disturbance_summary"),
                     "limitations": doc.get("limitations", []),
                     "created_at": doc.get("created_at").isoformat() if doc.get("created_at") else None,
                 }
