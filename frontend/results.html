@@ -15,6 +15,13 @@
       </div>
 
       <nav class="topbar__actions">
+        <div class="authBox">
+          <span id="authUserLabel" class="authUser">Not logged in</span>
+          <button id="loginBtn" class="btn btn--ghost" type="button">Login</button>
+          <button id="signupBtn" class="btn btn--ghost" type="button">Sign up</button>
+          <button id="logoutBtn" class="btn btn--ghost hidden" type="button">Logout</button>
+        </div>
+
         <a class="btn btn--ghost" href="./index.html">Setup</a>
         <a class="btn btn--ghost" href="./results.html">Results</a>
       </nav>
@@ -29,13 +36,13 @@
 
             <div class="kpis">
               <div class="kpi">
-                <div class="kpi__label">Baseline error (holdout)</div>
+                <div class="kpi__label">Baseline error (test)</div>
                 <div class="kpi__value" id="kpiBaseErr">—</div>
                 <div class="kpi__sub">RMSE / MAE / MAPE</div>
               </div>
 
               <div class="kpi">
-                <div class="kpi__label">PIML error (holdout)</div>
+                <div class="kpi__label">PIML error (test)</div>
                 <div class="kpi__value" id="kpiPimlErr">—</div>
                 <div class="kpi__sub">RMSE / MAE / MAPE</div>
               </div>
@@ -47,9 +54,9 @@
               </div>
 
               <div class="kpi">
-                <div class="kpi__label">Physics violations (forecast)</div>
+                <div class="kpi__label">Violations (selected segment)</div>
                 <div class="kpi__value" id="kpiPhys">—</div>
-                <div class="kpi__sub">counts in selected view</div>
+                <div class="kpi__sub">baseline vs piml</div>
               </div>
             </div>
 
@@ -57,6 +64,8 @@
               <div><span class="label">Prediction ID:</span> <span id="pidBox">—</span></div>
               <div><span class="label">Mode:</span> <span id="modeBox">—</span></div>
               <div><span class="label">Method:</span> <span id="methodBox">—</span></div>
+              <div><span class="label">Scale:</span> <span id="scaleBox">—</span></div>
+              <div><span class="label">Apply-to:</span> <span id="applyToBox">—</span></div>
             </div>
 
             <details class="details">
@@ -73,9 +82,12 @@
           </div>
 
           <div class="card">
-            <div class="card__title">Chart</div>
-            <div class="card__hint">Observed vs Baseline vs PIML. Switch view if you enabled disturbance.</div>
+            <div class="card__title">Results</div>
+            <div class="card__hint">
+              Compare shows Observed vs Raw vs Corrected. Delta shows corrected − raw. Violations shows rule hits.
+            </div>
 
+            <!-- View selector -->
             <div class="row row--tight">
               <label class="field field--inline">
                 <span class="field__label">View:</span>
@@ -88,12 +100,73 @@
               <button id="refreshBtn" class="btn btn--ghost" type="button">Refresh</button>
             </div>
 
-            <canvas id="chart" width="900" height="420" class="chart"></canvas>
+            <!-- Tabs -->
+            <div class="tabbar" style="margin-top: 10px;">
+              <button class="tabbtn tabbtn--active" id="tabCompare" type="button">Compare</button>
+              <button class="tabbtn" id="tabDelta" type="button">Delta</button>
+              <button class="tabbtn" id="tabViol" type="button">Violations</button>
+            </div>
 
-            <div class="legend">
-              <span class="dot dot--a"></span><span>Observed</span>
-              <span class="dot dot--b"></span><span>Baseline</span>
-              <span class="dot dot--c"></span><span>PIML</span>
+            <!-- Segment buttons -->
+            <div class="segbar" style="margin-top: 10px;">
+              <button class="segbtn" data-seg="all" type="button">All</button>
+              <button class="segbtn" data-seg="fit" type="button">Fit</button>
+              <button class="segbtn" data-seg="test" type="button">Test</button>
+              <button class="segbtn" data-seg="forecast" type="button">Forecast</button>
+              <button class="segbtn segbtn--active" data-seg="test_forecast" type="button">Test+Forecast</button>
+            </div>
+
+            <!-- Compare -->
+            <div id="panelCompare">
+              <canvas id="compareChart" width="900" height="420" class="chart"></canvas>
+              <div class="legend">
+                <span class="dot dot--a"></span><span>Observed</span>
+                <span class="dot dot--b"></span><span>Raw (baseline)</span>
+                <span class="dot dot--c"></span><span>Corrected (PIML)</span>
+              </div>
+            </div>
+
+            <!-- Delta -->
+            <div id="panelDelta" class="hidden">
+              <div class="deltaCards">
+                <div class="deltaCard">
+                  <div class="deltaCard__label">num_adjusted</div>
+                  <div class="deltaCard__value" id="deltaNum">—</div>
+                </div>
+                <div class="deltaCard">
+                  <div class="deltaCard__label">max_abs_adjustment</div>
+                  <div class="deltaCard__value" id="deltaMax">—</div>
+                </div>
+                <div class="deltaCard">
+                  <div class="deltaCard__label">mean_abs_adjustment</div>
+                  <div class="deltaCard__value" id="deltaMean">—</div>
+                </div>
+                <div class="deltaCard">
+                  <div class="deltaCard__label">adjusted_ratio</div>
+                  <div class="deltaCard__value" id="deltaRatio">—</div>
+                </div>
+              </div>
+
+              <canvas id="deltaChart" width="900" height="320" class="chart chart--sm"></canvas>
+              <div class="card__hint" style="margin-top: 8px;">
+                Delta is computed as (corrected − raw) on the selected segment.
+              </div>
+            </div>
+
+            <!-- Violations -->
+            <div id="panelViol" class="hidden">
+              <div class="violCards">
+                <div class="violCard">
+                  <div class="violCard__label">Rule hits (selected segment)</div>
+                  <div class="violCard__value" id="violSummary">—</div>
+                  <div class="violCard__sub">by_rule_counts from correction_summary</div>
+                </div>
+              </div>
+
+              <canvas id="violChart" width="900" height="220" class="chart chart--sm"></canvas>
+              <div class="card__hint" style="margin-top: 8px;">
+                Markers indicate where rules were applied (non_negative / cap / rate_limit / spike_clip).
+              </div>
             </div>
           </div>
         </div>
@@ -105,6 +178,7 @@
     </main>
 
     <script src="./config.js"></script>
+    <script defer src="https://cdn.auth0.com/js/auth0-spa-js/2.0/auth0-spa-js.production.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>

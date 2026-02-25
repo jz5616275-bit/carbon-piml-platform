@@ -1,9 +1,7 @@
 from __future__ import annotations
-
 import os
 import time
 from typing import Any, Dict, Optional
-
 import requests
 from flask import Request
 from jose import jwt
@@ -43,7 +41,6 @@ def _get_jwks(domain: str) -> Dict[str, Any]:
     resp = requests.get(url, timeout=5)
     resp.raise_for_status()
     jwks = resp.json()
-
     _JWKS_CACHE["jwks"] = jwks
     _JWKS_CACHE["fetched_at"] = now
     return jwks
@@ -57,13 +54,8 @@ def _pick_rsa_key(jwks: Dict[str, Any], kid: str) -> Optional[Dict[str, str]]:
 
 
 def get_user_from_request(req: Request) -> Dict[str, str]:
-    """
-    If AUTH_REQUIRED=true, missing/invalid token raises ValueError.
-    Otherwise falls back to anon (dev-friendly).
-    """
     cfg = _auth_config()
-    required = _bool_env("AUTH_REQUIRED", default=False)
-
+    required = _bool_env("AUTH_REQUIRED", default=True)
     token = _extract_bearer_token(req)
     if not token:
         if required:
@@ -71,9 +63,7 @@ def get_user_from_request(req: Request) -> Dict[str, str]:
         return {"user_id": "anon", "user_name": "Anonymous", "user_role": "user"}
 
     if not cfg["domain"] or not cfg["audience"] or not cfg["issuer"]:
-        if required:
-            raise ValueError("Auth0 config missing. Set AUTH0_DOMAIN, AUTH0_AUDIENCE, AUTH0_ISSUER.")
-        return {"user_id": "anon", "user_name": "Anonymous", "user_role": "user"}
+        raise ValueError("Auth0 config missing. Set AUTH0_DOMAIN, AUTH0_AUDIENCE, AUTH0_ISSUER.")
 
     try:
         header = jwt.get_unverified_header(token)
@@ -109,7 +99,5 @@ def get_user_from_request(req: Request) -> Dict[str, str]:
         return {"user_id": user_id, "user_name": user_name, "user_role": "user"}
 
     except (requests.RequestException, JWTError, ValueError) as e:
-        if required:
-            raise ValueError(f"Unauthorized: {str(e)}")
-        return {"user_id": "anon", "user_name": "Anonymous", "user_role": "user"}
+        raise ValueError(f"Unauthorized: {str(e)}")
 

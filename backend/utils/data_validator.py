@@ -4,7 +4,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-SUPPORTED_HORIZONS = {3, 6, 12, 24}
+SUPPORTED_HORIZONS_MONTHLY = [3, 6, 12, 24]
+SUPPORTED_HORIZONS_DAILY = [30, 60, 90]
 
 
 @dataclass
@@ -12,85 +13,12 @@ class CleanResult:
     time_col: str
     target_col: str
     feature_cols: List[str]
-    scale_detected: str  # daily | monthly | yearly
-    scale_used: str      # monthly (after resample if needed)
-    mode_detected: str   # basic | advanced
+    scale_detected: str
+    scale_used: str
+    mode_detected: str
     df_clean: pd.DataFrame
     stats: Dict[str, Any]
     warnings: List[str]
-
-
-def detect_time_column(df: pd.DataFrame) -> str:
-    if df.shape[1] < 2:
-        raise ValueError("CSV must have at least 2 columns (time + at least one numeric column).")
-
-    candidates = {str(c).lower().strip(): str(c) for c in df.columns}
-    for name in ("date", "time", "timestamp", "month"):
-        if name in candidates:
-            return candidates[name]
-
-    return str(df.columns[0])
-
-
-def parse_time_column(df: pd.DataFrame, time_col: str) -> pd.DataFrame:
-    s = df[time_col]
-    parsed = pd.to_datetime(s, errors="coerce", infer_datetime_format=True, utc=False)
-    non_empty = s.astype(str).str.strip().ne("")
-    if parsed[non_empty].isna().any():
-        raise ValueError("Invalid date format in time column. Please use YYYY-MM or YYYY-MM-DD formats.")
-
-    out = df.copy()
-    out[time_col] = parsed
-    out = out.sort_values(time_col)
-    return out
-
-
-def detect_time_scale(df: pd.DataFrame, time_col: str) -> str:
-    ts = df[time_col].dropna().sort_values()
-    if len(ts) < 2:
-        raise ValueError("Not enough time points (need at least 2 rows).")
-
-    diffs = ts.diff().dropna()
-    median_days = diffs.median() / np.timedelta64(1, "D")
-
-    if median_days <= 2:
-        return "daily"
-    if median_days <= 45:
-        return "monthly"
-    return "yearly"
-
-
-def infer_target_column(df: pd.DataFrame, time_col: str, target_override: Optional[str] = None) -> str:
-    if target_override:
-        if target_override not in df.columns:
-            raise ValueError(f"target_col '{target_override}' not found in CSV header.")
-        return target_override
-
-    candidates = [c for c in df.columns if c != time_col]
-    if not candidates:
-        raise ValueError("No candidate target columns found.")
-
-    numeric_cols: List[str] = []
-    for c in candidates:
-        coerced = pd.to_numeric(df[c], errors="coerce")
-        if coerced.notna().sum() > 0:
-            numeric_cols.append(c)
-
-    if not numeric_cols:
-        raise ValueError("No numeric emission column found.")
-
-    preferred_keywords = ("emission", "emissions", "co2", "carbon")
-    lowered = {c: str(c).lower() for c in numeric_cols}
-    for kw in preferred_keywords:
-        for c in numeric_cols:
-            if kw in lowered[c]:
-                return c
-
-    return numeric_cols[0]
-
-
-def infer_feature_columns(df: pd.DataFrame, time_col: str, target_col: str) -> List[str]:
-    return [c for c in df.columns if c not in (time_col, target_col)]
 
 
 def _missing_rate(series: pd.Series) -> float:
@@ -109,34 +37,145 @@ def _column_stats(df: pd.DataFrame, cols: List[str]) -> Dict[str, Dict[str, floa
     return out
 
 
+def _enforce_format(df: pd.DataFrame, target_override: Optional[str] = None) -> Tuple[str, str, List[str]]:
+    if df.shape[1] < 2:
+        raise ValueError("CSV must have at least 2 columns: date/time + target.")
+
+    time_col = str(df.columns[0])
+    if target_override:
+        if target_override not in df.columns:
+            raise ValueError(f"target_col '{target_override}' not found in CSV header.")
+        target_col = str(target_override)
+    else:
+        target_col = str(df.columns[-1])
+
+    if time_col == target_col:
+        raise ValueError("Invalid format: time column and target column cannot be the same.")
+
+    feature_cols = [str(c) for c in df.columns[1:-1] if str(c) not in (time_col, target_col)]
+    return time_col, target_col, feature_cols
+
+
+def parse_time_column(df: pd.DataFrame, time_col: str) -> Tuple[pd.DataFrame, List[str]]:
+    warnings: List[str] = []
+
+    s = df[time_col]
+    empty_mask = s.isna() | s.astype(str).str.strip().eq("")
+    non_empty = ~empty_mask
+
+    parsed = pd.to_datetime(s.where(non_empty, None), errors="coerce", utc=False)
+
+    if parsed[non_empty].isna().any():
+        raise ValueError("Invalid date format in first column. Use YYYY-MM or YYYY-MM-DD.")
+
+    out = df.copy()
+    out[time_col] = parsed
+
+    dropped = int(empty_mask.sum())
+    if dropped > 0:
+        warnings.append(f"Dropped {dropped} rows with missing timestamps in the first column.")
+
+    out = out.dropna(subset=[time_col]).sort_values(time_col)
+
+    if out[time_col].duplicated().any():
+        raise ValueError(
+            "Duplicated dates detected (likely long-format / multi-entity data). "
+            "Please pivot/filter to a single time series before upload."
+        )
+
+    return out, warnings
+
+
+def detect_time_scale(df: pd.DataFrame, time_col: str) -> str:
+    ts = df[time_col].dropna().sort_values()
+    if len(ts) < 2:
+        raise ValueError("Not enough time points (need at least 2 rows).")
+    diffs = ts.diff().dropna()
+    median_days = diffs.median() / np.timedelta64(1, "D")
+
+    if median_days <= 2:
+        return "daily"
+    if median_days <= 45:
+        return "monthly"
+    return "yearly"
+
+
+def _check_daily_continuity(index: pd.DatetimeIndex) -> None:
+    if len(index) < 2:
+        return
+    diffs = pd.Series(index).diff().dropna()
+    gaps = (diffs / np.timedelta64(1, "D")).astype(float)
+    if (gaps > 1.0).any():
+        max_gap = float(gaps.max())
+        raise ValueError(
+            f"Daily dates are not continuous (max gap: {max_gap:.0f} days). "
+            "Please fill missing dates or provide monthly data."
+        )
+
+
+def _ensure_numeric_columns(df: pd.DataFrame, cols: List[str], kind: str) -> None:
+    bad: List[str] = []
+    for c in cols:
+        coerced = pd.to_numeric(df[c], errors="coerce")
+        if coerced.notna().sum() == 0:
+            bad.append(str(c))
+    if bad:
+        raise ValueError(
+            f"{kind} columns must be numeric. Invalid columns: {', '.join(bad)}. "
+            "Please remove text/categorical columns or convert them to numeric."
+        )
+
+
+def _compute_basic_time_stats(df: pd.DataFrame, time_col: str) -> Dict[str, Any]:
+    if df.shape[0] == 0:
+        return {"n_points": 0}
+
+    start_ts = df[time_col].iloc[0]
+    end_ts = df[time_col].iloc[-1]
+    span_days = float((end_ts - start_ts) / np.timedelta64(1, "D")) if end_ts >= start_ts else 0.0
+
+    return {
+        "n_points": int(df.shape[0]),
+        "start_date": start_ts.date().isoformat(),
+        "end_date": end_ts.date().isoformat(),
+        "span_days": span_days,
+    }
+
+
 def clean_and_normalize(
     df_raw: pd.DataFrame,
     time_col: str,
     target_col: str,
     feature_cols: List[str],
     scale_detected: str,
+    parse_warnings: Optional[List[str]] = None,
 ) -> CleanResult:
     warnings: List[str] = []
     stats: Dict[str, Any] = {}
+
+    if parse_warnings:
+        warnings.extend(parse_warnings)
 
     if scale_detected == "yearly":
         raise ValueError("Yearly data is not supported. Please provide daily or monthly data.")
 
     df = df_raw.copy()
+    _ensure_numeric_columns(df, [target_col], "Target")
+    _ensure_numeric_columns(df, feature_cols, "Feature")
     df[target_col] = pd.to_numeric(df[target_col], errors="coerce")
     for c in feature_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-
     rows_total = int(df.shape[0])
-    df = df.dropna(subset=[time_col])
-    df = df.sort_values(time_col).set_index(time_col)
-    scale_used = "monthly"
+    df = df.dropna(subset=[time_col]).sort_values(time_col).set_index(time_col)
+
+    scale_used = "daily" if scale_detected == "daily" else "monthly"
+
     if scale_detected == "daily":
-        warnings.append("Daily data detected. Automatically resampled to monthly (mean).")
-        df = df.resample("M").mean(numeric_only=True)
+        _check_daily_continuity(df.index)
+        warnings.append("Daily data detected. Kept daily frequency (no resampling).")
 
     if df.shape[0] < 2:
-        raise ValueError("Not enough valid time points after preprocessing (need at least 2).")
+        raise ValueError("Not enough valid time points after preprocessing (need at least 2 points).")
 
     target_missing = _missing_rate(df[target_col])
     stats["target_missing_rate"] = target_missing
@@ -144,6 +183,7 @@ def clean_and_normalize(
         raise ValueError("Too many missing values in target column (>20%). Please clean your dataset and re-upload.")
     if target_missing > 0:
         df[target_col] = df[target_col].interpolate(limit_direction="both")
+        warnings.append("Missing target values were interpolated (limit <= 20%).")
 
     mode_detected = "advanced" if len(feature_cols) > 0 else "basic"
     stats["feature_cols"] = feature_cols
@@ -158,12 +198,16 @@ def clean_and_normalize(
 
         if bad_feature_cols:
             raise ValueError("Too many missing values in feature columns (>20%): " + ", ".join(bad_feature_cols))
-        df[feature_cols] = df[feature_cols].ffill().bfill()
+
+        if any(_missing_rate(df[c]) > 0 for c in feature_cols):
+            df[feature_cols] = df[feature_cols].ffill().bfill()
+            warnings.append("Missing feature values were forward/back filled (limit <= 20%).")
 
     df = df.dropna(subset=[target_col])
     rows_valid = int(df.shape[0])
     rows_invalid = rows_total - rows_valid
-
+    tmp = df.reset_index()
+    stats.update(_compute_basic_time_stats(tmp, time_col))
     stats.update(
         {
             "rows_total": rows_total,
@@ -174,7 +218,6 @@ def clean_and_normalize(
             "mode_detected": mode_detected,
         }
     )
-
     stats["target_stats"] = _column_stats(df, [target_col])
     stats["feature_stats"] = _column_stats(df, feature_cols)
 
@@ -209,50 +252,74 @@ def validate_and_prepare_upload(
     dataset_name: str,
     target_override: Optional[str] = None,
 ) -> Tuple[CleanResult, List[Dict[str, Any]]]:
-    time_col = detect_time_column(df_raw)
-    df_parsed = parse_time_column(df_raw, time_col)
+    _ = dataset_name
+    time_col, target_col, feature_cols = _enforce_format(df_raw, target_override=target_override)
+    df_parsed, parse_warnings = parse_time_column(df_raw, time_col)
     scale_detected = detect_time_scale(df_parsed, time_col)
-    target_col = infer_target_column(df_parsed, time_col, target_override=target_override)
-    feature_cols = infer_feature_columns(df_parsed, time_col, target_col)
     clean = clean_and_normalize(
         df_raw=df_parsed,
         time_col=time_col,
         target_col=target_col,
         feature_cols=feature_cols,
         scale_detected=scale_detected,
+        parse_warnings=parse_warnings,
     )
 
     points = dataframe_to_points(clean.df_clean, clean.target_col, clean.feature_cols)
     if len(points) < 2:
-        raise ValueError("Not enough points after preprocessing (need at least 2 monthly points).")
+        raise ValueError("Not enough points after preprocessing (need at least 2 points).")
 
     return clean, points
 
 
-def validate_horizon(horizon: int, n_points: int) -> None:
-    if horizon not in SUPPORTED_HORIZONS:
-        raise ValueError("horizon_months must be one of: 3, 6, 12, 24")
+def get_supported_horizons(scale_used: str) -> List[int]:
+    scale = (scale_used or "monthly").strip().lower()
+    if scale == "daily":
+        return SUPPORTED_HORIZONS_DAILY[:]
+    return SUPPORTED_HORIZONS_MONTHLY[:]
 
-    if n_points < 6:
-        raise ValueError("At least 6 monthly points are required to create a forecast.")
 
-    max_allowed = int(max(3, np.floor(n_points * 0.5)))
+def validate_horizon(horizon: int, n_points: int, *, scale_used: str = "monthly") -> None:
+    scale = (scale_used or "monthly").strip().lower()
+    supported = get_supported_horizons(scale)
+
+    if horizon not in supported:
+        raise ValueError(f"horizon must be one of: {', '.join(str(x) for x in supported)}")
+
+    if scale == "monthly":
+        if n_points < 6:
+            raise ValueError("At least 6 monthly points are required to create a forecast.")
+        max_allowed = int(max(3, np.floor(n_points * 0.5)))
+        if horizon > max_allowed:
+            allowed = [h for h in supported if h <= max_allowed]
+            suggest = allowed[-1] if allowed else supported[0]
+            raise ValueError(
+                f"horizon too large for available history. "
+                f"Got horizon={horizon} months, history={n_points}. "
+                f"Try {suggest} (or <= {max_allowed})."
+            )
+        return
+
+    # daily
+    if n_points < 30:
+        raise ValueError("At least 30 daily points are required to create a forecast.")
+    max_allowed = int(max(30, np.floor(n_points * 0.5)))
     if horizon > max_allowed:
+        allowed = [h for h in supported if h <= max_allowed]
+        suggest = allowed[-1] if allowed else supported[0]
         raise ValueError(
-            f"horizon_months too large for available history. "
-            f"Got horizon={horizon}, history={n_points}. Try horizon <= {max_allowed}."
+            f"horizon too large for available daily history. "
+            f"Got horizon={horizon} days, history={n_points} days. "
+            f"Try {suggest} (or <= {max_allowed})."
         )
 
 
 def validate_evaluation(evaluation: Dict[str, Any] | None, *, n_points: int) -> Dict[str, Any]:
-    # Default: enabled evaluation with 20% holdout
     if not evaluation:
         return {"enabled": True, "split": {"mode": "ratio", "test_ratio": 0.2}}
-
     enabled = bool(evaluation.get("enabled", True))
     if not enabled:
         return {"enabled": False, "split": None}
-
     if n_points < 6:
         raise ValueError("Not enough points for evaluation (need >= 6).")
 
@@ -267,7 +334,6 @@ def validate_evaluation(evaluation: Dict[str, Any] | None, *, n_points: int) -> 
         if n_points <= k:
             raise ValueError("Not enough points for lastN split.")
         return {"enabled": True, "split": {"mode": "lastn", "test_points": k}}
-
     if mode == "ratio":
         r = split.get("test_ratio", 0.2)
         try:
@@ -292,11 +358,9 @@ def validate_disturbance(
 ) -> Dict[str, Any]:
     if not disturbance:
         return {"enabled": False, "mode": mode_used, "global_pct": None, "feature_pct": None}
-
     enabled = bool(disturbance.get("enabled", False))
     if not enabled:
         return {"enabled": False, "mode": mode_used, "global_pct": None, "feature_pct": None}
-
     if mode_used == "basic":
         gp = disturbance.get("global_pct", 0.0)
         try:
@@ -306,7 +370,6 @@ def validate_disturbance(
 
         if gp <= -0.95:
             raise ValueError("disturbance.global_pct too small (must be > -0.95)")
-
         return {"enabled": True, "mode": "basic", "global_pct": gp, "feature_pct": None}
 
     feature_pct = disturbance.get("feature_pct") or {}
@@ -326,5 +389,4 @@ def validate_disturbance(
         if fv <= -0.95:
             raise ValueError(f"disturbance.feature_pct[{k}] too small (must be > -0.95)")
         normalized[k] = fv
-
     return {"enabled": True, "mode": "advanced", "global_pct": None, "feature_pct": normalized}

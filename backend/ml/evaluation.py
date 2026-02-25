@@ -62,27 +62,53 @@ def accuracy_metrics(y_true: List[float], y_pred: List[float]) -> Dict[str, floa
 
 def _summarize_corrections(correction_summary: Dict[str, Any] | None) -> Dict[str, Any]:
     if not correction_summary:
-        return {"num_adjusted": 0, "by_rule": {}, "max_abs_adjustment": 0.0}
+        return {
+            "num_adjusted": 0,
+            "max_abs_adjustment": 0.0,
+            "mean_abs_adjustment": 0.0,
+            "adjusted_ratio": 0.0,
+            "by_rule_counts": {},
+            "adjustments": [],
+        }
 
+    by_rule_counts = correction_summary.get("by_rule_counts") or correction_summary.get("by_rule") or {}
     adjustments = correction_summary.get("adjustments") or []
-    by_rule: Dict[str, int] = {}
-    max_abs = 0.0
+    num_adjusted = correction_summary.get("num_adjusted")
 
+    deltas = []
     for a in adjustments:
-        rule = str(a.get("rule") or "unknown")
-        by_rule[rule] = int(by_rule.get(rule, 0) + 1)
-
         try:
-            f = float(a.get("from"))
-            t = float(a.get("to"))
-            max_abs = max(max_abs, abs(t - f))
+            deltas.append(abs(float(a.get("delta", float(a.get("to")) - float(a.get("from"))))))
         except Exception:
             pass
 
+    max_abs = correction_summary.get("max_abs_adjustment")
+    if max_abs is None:
+        max_abs = float(max(deltas)) if deltas else 0.0
+
+    mean_abs = correction_summary.get("mean_abs_adjustment")
+    if mean_abs is None:
+        mean_abs = float(sum(deltas) / len(deltas)) if deltas else 0.0
+
+    if num_adjusted is None:
+        num_adjusted = len(adjustments)
+
+    adjusted_ratio = correction_summary.get("adjusted_ratio")
+    if adjusted_ratio is None:
+        # Fallback: ratio of changed points among adjustments (rough)
+        changed = set()
+        for a in adjustments:
+            changed.add((a.get("date"), a.get("kind")))
+        denom = max(1, len(set((p.get("date"), p.get("kind")) for p in adjustments))) if adjustments else 1
+        adjusted_ratio = float(len(changed) / denom) if denom else 0.0
+
     return {
-        "num_adjusted": int(correction_summary.get("num_adjusted") or len(adjustments) or 0),
-        "by_rule": by_rule,
-        "max_abs_adjustment": float(max_abs),
+        "num_adjusted": int(num_adjusted or 0),
+        "max_abs_adjustment": float(max_abs or 0.0),
+        "mean_abs_adjustment": float(mean_abs or 0.0),
+        "adjusted_ratio": float(adjusted_ratio or 0.0),
+        "by_rule_counts": dict(by_rule_counts or {}),
+        "adjustments": adjustments,
     }
 
 
@@ -95,11 +121,6 @@ def physical_metrics(
     prev_value: float | None = None,
     correction_summary: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    """
-    Two sources:
-      - series values -> violations + max magnitudes (works for baseline/piml)
-      - correction_summary -> "how many times we clipped" (important for smoothness)
-    """
     n = len(series) if series else 0
     if n == 0:
         return {
@@ -107,7 +128,13 @@ def physical_metrics(
             "violations": {"negatives": 0, "cap": 0, "jump": 0},
             "ratios": {"negatives": 0.0, "cap": 0.0, "jump": 0.0},
             "max": {"cap_excess": 0.0, "jump_excess": 0.0, "abs_change": 0.0, "change_rate": 0.0},
-            "corrections": {"num_adjusted": 0, "by_rule": {}, "max_abs_adjustment": 0.0},
+            "corrections": _summarize_corrections(correction_summary),
+            "negatives": 0,
+            "cap_violations": 0,
+            "jump_violations": 0,
+            "negatives_ratio": 0.0,
+            "cap_violations_ratio": 0.0,
+            "jump_violations_ratio": 0.0,
         }
 
     neg = 0
@@ -139,7 +166,6 @@ def physical_metrics(
             base = abs(prev) if abs(prev) > 1e-9 else 1.0
             allowed = r * base
 
-            # observed rate: abs change / base
             max_rate_observed = max(max_rate_observed, float(abs_change / base))
 
             if abs_change > allowed:
@@ -147,16 +173,19 @@ def physical_metrics(
                 max_jump_excess = max(max_jump_excess, abs_change - allowed)
 
         prev = y
-
     corr_agg = _summarize_corrections(correction_summary)
 
     def _ratio(c: int) -> float:
         return float(c) / float(n) if n > 0 else 0.0
 
+    neg_r = _ratio(neg)
+    cap_r = _ratio(cap_v)
+    jump_r = _ratio(jump)
+
     return {
         "n": int(n),
         "violations": {"negatives": int(neg), "cap": int(cap_v), "jump": int(jump)},
-        "ratios": {"negatives": _ratio(neg), "cap": _ratio(cap_v), "jump": _ratio(jump)},
+        "ratios": {"negatives": float(neg_r), "cap": float(cap_r), "jump": float(jump_r)},
         "max": {
             "cap_excess": float(max_cap_excess),
             "jump_excess": float(max_jump_excess),
@@ -164,6 +193,12 @@ def physical_metrics(
             "change_rate": float(max_rate_observed),
         },
         "corrections": corr_agg,
+        "negatives": int(neg),
+        "cap_violations": int(cap_v),
+        "jump_violations": int(jump),
+        "negatives_ratio": float(neg_r),
+        "cap_violations_ratio": float(cap_r),
+        "jump_violations_ratio": float(jump_r),
     }
 
 
@@ -175,7 +210,6 @@ def predict_basic_on_test(train: List[Dict[str, Any]], test: List[Dict[str, Any]
     n_test = len(test)
     xt = np.arange(n_train, n_train + n_test, dtype=float)
     yt = (a * xt + b).tolist()
-
     out: List[Dict[str, Any]] = []
     for i, p in enumerate(test):
         out.append({"date": p["date"], "value": float(yt[i]), "kind": "test_pred"})
@@ -272,15 +306,13 @@ def evaluate_history(
         non_negative=physics_params["non_negative"],
         max_change_rate=physics_params["max_change_rate"],
         cap_value=physics_params["cap_value"],
+        apply_to="test_forecast",  # evaluation always corrects test_pred if physics enabled
     )
 
     y_pred_base = [float(p["value"]) for p in baseline_test]
     y_pred_piml = [float(p["value"]) for p in piml_test]
-
     base_acc = accuracy_metrics(y_true, y_pred_base)
     piml_acc = accuracy_metrics(y_true, y_pred_piml)
-
-    # baseline has no corrections; piml has corr summary
     base_phys = physical_metrics(
         baseline_test,
         non_negative=bool(physics_params["non_negative"]),
@@ -311,5 +343,5 @@ def evaluate_history(
             "baseline": {"accuracy": base_acc, "physics": base_phys},
             "piml": {"accuracy": piml_acc, "physics": piml_phys},
         },
-        "correction_summary": corr,
+        "correction_summary": _summarize_corrections(corr),
     }

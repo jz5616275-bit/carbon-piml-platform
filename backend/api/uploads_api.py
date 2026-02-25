@@ -80,6 +80,8 @@ def create_upload():
         )
 
     except ValueError as e:
+        import traceback
+        traceback.print_exc()
         return make_response(
             jsonify({"error": str(e), "hint": "Check your time column, numeric target, and missing values."}),
             400,
