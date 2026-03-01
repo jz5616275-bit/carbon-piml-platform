@@ -6,6 +6,7 @@ import pandas as pd
 
 SUPPORTED_HORIZONS_MONTHLY = [3, 6, 12, 24]
 SUPPORTED_HORIZONS_DAILY = [30, 60, 90]
+SUPPORTED_HORIZONS_YEARLY = [5, 10, 20, 30]
 
 
 @dataclass
@@ -58,19 +59,27 @@ def _enforce_format(df: pd.DataFrame, target_override: Optional[str] = None) -> 
 
 def parse_time_column(df: pd.DataFrame, time_col: str) -> Tuple[pd.DataFrame, List[str]]:
     warnings: List[str] = []
-
     s = df[time_col]
     empty_mask = s.isna() | s.astype(str).str.strip().eq("")
     non_empty = ~empty_mask
-
-    parsed = pd.to_datetime(s.where(non_empty, None), errors="coerce", utc=False)
+    s_non_empty = s.where(non_empty, None)
+    parsed: pd.Series
+    if pd.api.types.is_numeric_dtype(s_non_empty):
+        num = pd.to_numeric(s_non_empty, errors="coerce")
+        looks_like_year = num.notna() & (num >= 1800) & (num <= 2200) & ((num % 1) == 0)
+        if looks_like_year.sum() >= max(2, int(0.8 * num.notna().sum())):
+            year_str = num.round().astype("Int64").astype(str)
+            parsed = pd.to_datetime(year_str.where(non_empty, None), errors="coerce", format="%Y", utc=False)
+        else:
+            parsed = pd.to_datetime(s_non_empty, errors="coerce", utc=False)
+    else:
+        parsed = pd.to_datetime(s_non_empty, errors="coerce", utc=False)
 
     if parsed[non_empty].isna().any():
-        raise ValueError("Invalid date format in first column. Use YYYY-MM or YYYY-MM-DD.")
+        raise ValueError("Invalid date format in first column. Use YYYY, YYYY-MM, or YYYY-MM-DD.")
 
     out = df.copy()
     out[time_col] = parsed
-
     dropped = int(empty_mask.sum())
     if dropped > 0:
         warnings.append(f"Dropped {dropped} rows with missing timestamps in the first column.")
@@ -133,7 +142,6 @@ def _compute_basic_time_stats(df: pd.DataFrame, time_col: str) -> Dict[str, Any]
     start_ts = df[time_col].iloc[0]
     end_ts = df[time_col].iloc[-1]
     span_days = float((end_ts - start_ts) / np.timedelta64(1, "D")) if end_ts >= start_ts else 0.0
-
     return {
         "n_points": int(df.shape[0]),
         "start_date": start_ts.date().isoformat(),
@@ -156,9 +164,6 @@ def clean_and_normalize(
     if parse_warnings:
         warnings.extend(parse_warnings)
 
-    if scale_detected == "yearly":
-        raise ValueError("Yearly data is not supported. Please provide daily or monthly data.")
-
     df = df_raw.copy()
     _ensure_numeric_columns(df, [target_col], "Target")
     _ensure_numeric_columns(df, feature_cols, "Feature")
@@ -168,11 +173,17 @@ def clean_and_normalize(
     rows_total = int(df.shape[0])
     df = df.dropna(subset=[time_col]).sort_values(time_col).set_index(time_col)
 
-    scale_used = "daily" if scale_detected == "daily" else "monthly"
+    scale_used = (scale_detected or "monthly").strip().lower()
+    if scale_used not in ("daily", "monthly", "yearly"):
+        scale_used = "monthly"
 
     if scale_detected == "daily":
         _check_daily_continuity(df.index)
         warnings.append("Daily data detected. Kept daily frequency (no resampling).")
+    elif scale_detected == "monthly":
+        warnings.append("Monthly data detected. Kept monthly frequency (no resampling).")
+    else:
+        warnings.append("Yearly data detected. Kept yearly frequency (no resampling).")
 
     if df.shape[0] < 2:
         raise ValueError("Not enough valid time points after preprocessing (need at least 2 points).")
@@ -276,6 +287,8 @@ def get_supported_horizons(scale_used: str) -> List[int]:
     scale = (scale_used or "monthly").strip().lower()
     if scale == "daily":
         return SUPPORTED_HORIZONS_DAILY[:]
+    if scale == "yearly":
+        return SUPPORTED_HORIZONS_YEARLY[:]
     return SUPPORTED_HORIZONS_MONTHLY[:]
 
 
@@ -300,28 +313,44 @@ def validate_horizon(horizon: int, n_points: int, *, scale_used: str = "monthly"
             )
         return
 
-    # daily
+    if scale == "daily":
+        if n_points < 30:
+            raise ValueError("At least 30 daily points are required to create a forecast.")
+        max_allowed = int(max(30, np.floor(n_points * 0.5)))
+        if horizon > max_allowed:
+            allowed = [h for h in supported if h <= max_allowed]
+            suggest = allowed[-1] if allowed else supported[0]
+            raise ValueError(
+                f"horizon too large for available daily history. "
+                f"Got horizon={horizon} days, history={n_points} days. "
+                f"Try {suggest} (or <= {max_allowed})."
+            )
+        return
+
     if n_points < 30:
-        raise ValueError("At least 30 daily points are required to create a forecast.")
-    max_allowed = int(max(30, np.floor(n_points * 0.5)))
+        raise ValueError("At least 30 yearly points are required to create a forecast.")
+    max_allowed = int(max(5, np.floor(n_points * 0.5)))
     if horizon > max_allowed:
         allowed = [h for h in supported if h <= max_allowed]
         suggest = allowed[-1] if allowed else supported[0]
         raise ValueError(
-            f"horizon too large for available daily history. "
-            f"Got horizon={horizon} days, history={n_points} days. "
+            f"horizon too large for available yearly history. "
+            f"Got horizon={horizon} years, history={n_points} years. "
             f"Try {suggest} (or <= {max_allowed})."
         )
 
 
-def validate_evaluation(evaluation: Dict[str, Any] | None, *, n_points: int) -> Dict[str, Any]:
+def validate_evaluation(evaluation: Dict[str, Any] | None, *, n_points: int, scale_used: str = "monthly") -> Dict[str, Any]:
     if not evaluation:
         return {"enabled": True, "split": {"mode": "ratio", "test_ratio": 0.2}}
     enabled = bool(evaluation.get("enabled", True))
     if not enabled:
         return {"enabled": False, "split": None}
-    if n_points < 6:
-        raise ValueError("Not enough points for evaluation (need >= 6).")
+
+    scale = (scale_used or "monthly").strip().lower()
+    min_points = 30 if scale in ("daily", "yearly") else 6
+    if n_points < min_points:
+        raise ValueError(f"Not enough points for evaluation (need >= {min_points}).")
 
     split = evaluation.get("split") or {}
     mode = str(split.get("mode") or "ratio").strip().lower()
@@ -334,6 +363,7 @@ def validate_evaluation(evaluation: Dict[str, Any] | None, *, n_points: int) -> 
         if n_points <= k:
             raise ValueError("Not enough points for lastN split.")
         return {"enabled": True, "split": {"mode": "lastn", "test_points": k}}
+
     if mode == "ratio":
         r = split.get("test_ratio", 0.2)
         try:

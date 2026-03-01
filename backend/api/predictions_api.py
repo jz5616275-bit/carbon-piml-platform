@@ -1,6 +1,6 @@
 from __future__ import annotations
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 import numpy as np
 from bson import ObjectId
 from dateutil.relativedelta import relativedelta
@@ -20,64 +20,6 @@ def _detect_mode_from_upload(upload: Dict[str, Any]) -> str:
     return "advanced" if len(feature_cols) > 0 else "basic"
 
 
-def _parse_predict_payload() -> Tuple[str, int, str | None, Dict[str, Any], Dict[str, Any] | None, Dict[str, Any] | None]:
-    payload = request.get_json(silent=True) or {}
-    upload_id = payload.get("upload_id")
-    if not upload_id:
-        raise ValueError("Missing field: upload_id")
-
-    horizon = payload.get("horizon_months", 12)
-    try:
-        horizon = int(horizon)
-    except Exception:
-        raise ValueError("horizon_months must be an integer")
-
-    mode_override = payload.get("mode_override")
-    if mode_override is not None and mode_override not in ("basic", "advanced"):
-        raise ValueError("mode_override must be 'basic' or 'advanced'")
-
-    physics_mode = (payload.get("physics_mode") or "none").strip().lower()
-    if physics_mode not in ("none", "non_negative", "smoothness", "cap", "full"):
-        raise ValueError("physics_mode must be one of: none, non_negative, smoothness, cap, full")
-
-    physics = payload.get("physics") or {}
-    if physics is None:
-        physics = {}
-
-    non_negative = bool(physics.get("non_negative", True))
-    max_change_rate = physics.get("max_change_rate", 0.25)
-    try:
-        max_change_rate = float(max_change_rate)
-    except Exception:
-        raise ValueError("physics.max_change_rate must be a number")
-
-    cap_value = physics.get("cap_value", None)
-    if cap_value is not None:
-        try:
-            cap_value = float(cap_value)
-        except Exception:
-            raise ValueError("physics.cap_value must be a number or null")
-        if cap_value < 0:
-            raise ValueError("cap_value must be >= 0")
-
-    apply_to = (physics.get("apply_to") or "test_forecast").strip().lower()
-    if apply_to not in ("forecast", "test_forecast"):
-        raise ValueError("physics.apply_to must be 'forecast' or 'test_forecast'")
-
-    physics_params = {
-        "physics_mode": physics_mode,
-        "non_negative": non_negative,
-        "max_change_rate": max_change_rate,
-        "cap_value": cap_value,
-        "apply_to": apply_to,
-    }
-
-    disturbance = payload.get("disturbance")
-    evaluation = payload.get("evaluation")
-
-    return upload_id, horizon, mode_override, physics_params, disturbance, evaluation
-
-
 def _month_add(iso_date: str, k: int) -> str:
     d = datetime.fromisoformat(iso_date).date()
     return (d + relativedelta(months=+k)).isoformat()
@@ -88,37 +30,56 @@ def _day_add(iso_date: str, k: int) -> str:
     return (d + relativedelta(days=+k)).isoformat()
 
 
-def _fourier_block(t: np.ndarray, period: float) -> np.ndarray:
-    # Returns 2 columns
-    ang = (2.0 * np.pi / float(period)) * t
-    return np.column_stack([np.sin(ang), np.cos(ang)])
+def _year_add(iso_date: str, k: int) -> str:
+    d = datetime.fromisoformat(iso_date).date()
+    return (d + relativedelta(years=+k)).isoformat()
 
 
-def _basic_design(t: np.ndarray, *, scale_used: str) -> np.ndarray:
-    # Basic baseline
-    ones = np.ones((t.shape[0], 1), dtype=float)
-    trend = t.reshape(-1, 1)
+def _ridge_solve(X: np.ndarray, y: np.ndarray, alpha: float) -> np.ndarray:
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    XtX = X.T @ X
+    Xty = X.T @ y
+    I = np.eye(X.shape[1], dtype=float)
+    a = float(alpha)
+    for _ in range(6):
+        try:
+            return np.linalg.solve(XtX + a * I, Xty)
+        except np.linalg.LinAlgError:
+            a *= 10.0
 
-    if scale_used == "monthly":
-        s12 = _fourier_block(t, 12.0)
-        s6 = _fourier_block(t, 6.0)
-        return np.hstack([ones, trend, s12, s6])
-    # daily
-    s30 = _fourier_block(t, 30.0)
-    s7 = _fourier_block(t, 7.0)
-    return np.hstack([ones, trend, s30, s7])
+    w, *_ = np.linalg.lstsq(X, y, rcond=None)
+    return w
+
+
+def _time_basis(t: np.ndarray, periods: List[float], *, trend_degree: int = 1) -> np.ndarray:
+    t = np.asarray(t, dtype=float).reshape(-1)
+    feats: List[np.ndarray] = [np.ones_like(t)]
+    if trend_degree >= 1:
+        feats.append(t)
+    if trend_degree >= 2:
+        feats.append(t**2)
+
+    for p in periods:
+        if p <= 0:
+            continue
+        ang = 2.0 * np.pi * t / float(p)
+        feats.append(np.sin(ang))
+        feats.append(np.cos(ang))
+
+    return np.vstack(feats).T
 
 
 def _basic_predict_monthly(points: List[Dict[str, Any]], horizon_months: int) -> List[Dict[str, Any]]:
     n = len(points)
     t = np.arange(n, dtype=float)
     y = np.array([float(p["y"]) for p in points], dtype=float)
-    X = _basic_design(t, scale_used="monthly")
-    w, *_ = np.linalg.lstsq(X, y, rcond=None)
+    X = _time_basis(t, periods=[12.0], trend_degree=1)
+    w = _ridge_solve(X, y, alpha=1.0)
     fitted = (X @ w).tolist()
-    future_t = np.arange(n, n + horizon_months, dtype=float)
-    future_X = _basic_design(future_t, scale_used="monthly")
-    future_y = (future_X @ w).tolist()
+    ft = np.arange(n, n + horizon_months, dtype=float)
+    Xf = _time_basis(ft, periods=[12.0], trend_degree=1)
+    future_y = (Xf @ w).tolist()
     last_date = points[-1]["date"]
     future_dates = [_month_add(last_date, i) for i in range(1, horizon_months + 1)]
     out: List[Dict[str, Any]] = []
@@ -129,39 +90,108 @@ def _basic_predict_monthly(points: List[Dict[str, Any]], horizon_months: int) ->
     return out
 
 
-def _basic_predict_daily(points: List[Dict[str, Any]], horizon_days: int) -> List[Dict[str, Any]]:
+def _basic_predict_yearly(points: List[Dict[str, Any]], horizon_years: int) -> List[Dict[str, Any]]:
     n = len(points)
     t = np.arange(n, dtype=float)
     y = np.array([float(p["y"]) for p in points], dtype=float)
-    X = _basic_design(t, scale_used="daily")
-    w, *_ = np.linalg.lstsq(X, y, rcond=None)
+    X = _time_basis(t, periods=[], trend_degree=1)
+    w = _ridge_solve(X, y, alpha=1.0)
     fitted = (X @ w).tolist()
-    future_t = np.arange(n, n + horizon_days, dtype=float)
-    future_X = _basic_design(future_t, scale_used="daily")
-    future_y = (future_X @ w).tolist()
+    ft = np.arange(n, n + horizon_years, dtype=float)
+    Xf = _time_basis(ft, periods=[], trend_degree=1)
+    future_y = (Xf @ w).tolist()
     last_date = points[-1]["date"]
-    future_dates = [_day_add(last_date, i) for i in range(1, horizon_days + 1)]
+    future_dates = [_year_add(last_date, i) for i in range(1, horizon_years + 1)]
     out: List[Dict[str, Any]] = []
     for i in range(n):
         out.append({"date": points[i]["date"], "value": float(fitted[i]), "kind": "fitted"})
-    for i in range(horizon_days):
+    for i in range(horizon_years):
         out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
     return out
 
 
-def _advanced_design(X: np.ndarray, t: np.ndarray, *, scale_used: str) -> np.ndarray:
-    # Advanced baseline
-    ones = np.ones((X.shape[0], 1), dtype=float)
-    trend = t.reshape(-1, 1)
+def _basic_predict_daily(points: List[Dict[str, Any]], horizon_days: int) -> List[Dict[str, Any]]:
+    n = len(points)
+    y = np.array([float(p["y"]) for p in points], dtype=float)
+    lags = [1, 7, 14]
+    max_lag = max(lags)
+    if n <= max_lag + 5:
+        t = np.arange(n, dtype=float)
+        X = _time_basis(t, periods=[7.0, 30.0, 365.25], trend_degree=1)
+        w = _ridge_solve(X, y, alpha=50.0)
+        fitted = (X @ w).tolist()
+        ft = np.arange(n, n + horizon_days, dtype=float)
+        Xf = _time_basis(ft, periods=[7.0, 30.0, 365.25], trend_degree=1)
+        future_y = (Xf @ w).tolist()
+        last_date = points[-1]["date"]
+        future_dates = [_day_add(last_date, i) for i in range(1, horizon_days + 1)]
+        out: List[Dict[str, Any]] = []
+        for i in range(n):
+            out.append({"date": points[i]["date"], "value": float(fitted[i]), "kind": "fitted"})
+        for i in range(horizon_days):
+            out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
+        return out
 
-    if scale_used == "monthly":
-        s12 = _fourier_block(t, 12.0)
-        s6 = _fourier_block(t, 6.0)
-        return np.hstack([ones, X, trend, s12, s6])
+    idx = np.arange(max_lag, n, dtype=int)
+    t = idx.astype(float)
+    t0 = float(max_lag)
+    t_scale = float(max(1, (n - 1) - max_lag))
+    t_norm = (t - t0) / t_scale
+    t_season = (idx - max_lag).astype(float)
+    X_time = _time_basis(t_season, periods=[7.0, 30.0, 365.25], trend_degree=0)
+    X_trend = np.vstack([np.ones_like(t_norm), t_norm]).T
 
-    s30 = _fourier_block(t, 30.0)
-    s7 = _fourier_block(t, 7.0)
-    return np.hstack([ones, X, trend, s30, s7])
+    def _roll_mean(arr: np.ndarray, end_i: int, win: int) -> float:
+        s = end_i - win
+        if s < 0:
+            s = 0
+        return float(np.mean(arr[s:end_i]))
+
+    X_ar: List[List[float]] = []
+    y_train: List[float] = []
+    for i in idx:
+        row = [
+            float(y[i - 1]),
+            float(y[i - 7]),
+            float(y[i - 14]),
+            _roll_mean(y, i, 7),
+        ]
+        X_ar.append(row)
+        y_train.append(float(y[i]))
+
+    X_ar_np = np.asarray(X_ar, dtype=float)
+    y_np = np.asarray(y_train, dtype=float)
+    X = np.hstack([X_trend, X_time, X_ar_np])
+    w = _ridge_solve(X, y_np, alpha=5.0)
+    fitted_all = np.zeros(n, dtype=float)
+    fitted_all[:max_lag] = y[:max_lag]
+    fitted_all[max_lag:] = (X @ w)
+    future_vals: List[float] = []
+    buf = list(y.tolist())
+    for k in range(1, horizon_days + 1):
+        i = n - 1 + k
+        t_seas = float(i - max_lag)
+        t_norm_f = (float(i) - t0) / t_scale
+        X_time_f = _time_basis(np.array([t_seas]), periods=[7.0, 30.0, 365.25], trend_degree=0)
+        X_trend_f = np.array([[1.0, t_norm_f]], dtype=float)
+        lag1 = float(buf[-1])
+        lag7 = float(buf[-7]) if len(buf) >= 7 else float(buf[-1])
+        lag14 = float(buf[-14]) if len(buf) >= 14 else float(buf[-1])
+        rm7 = float(np.mean(buf[-7:])) if len(buf) >= 7 else float(np.mean(buf))
+        X_ar_f = np.array([[lag1, lag7, lag14, rm7]], dtype=float)
+        Xf = np.hstack([X_trend_f, X_time_f, X_ar_f])
+        y_next = float((Xf @ w).reshape(-1)[0])
+        future_vals.append(y_next)
+        buf.append(y_next)
+
+    last_date = points[-1]["date"]
+    future_dates = [_day_add(last_date, i) for i in range(1, horizon_days + 1)]
+    out: List[Dict[str, Any]] = []
+    for i in range(n):
+        out.append({"date": points[i]["date"], "value": float(fitted_all[i]), "kind": "fitted"})
+    for i in range(horizon_days):
+        out.append({"date": future_dates[i], "value": float(future_vals[i]), "kind": "forecast"})
+    return out
 
 
 def _advanced_fit(
@@ -169,55 +199,68 @@ def _advanced_fit(
     feature_cols: List[str],
     *,
     scale_used: str,
-) -> Tuple[np.ndarray, List[str], np.ndarray]:
+) -> Tuple[np.ndarray, List[str], np.ndarray, np.ndarray]:
     X_rows: List[List[float]] = []
     y_vals: List[float] = []
     dates: List[str] = []
+    t_vals: List[float] = []
 
-    for p in points:
+    for i, p in enumerate(points):
         feats = p.get("features", {}) or {}
         row: List[float] = []
-        valid = True
-
+        ok = True
         for col in feature_cols:
             v = feats.get(col)
             if v is None:
-                valid = False
+                ok = False
                 break
             try:
                 row.append(float(v))
             except Exception:
-                valid = False
+                ok = False
                 break
-
-        if not valid:
+        if not ok:
             continue
 
         dates.append(p["date"])
         X_rows.append(row)
         y_vals.append(float(p["y"]))
+        t_vals.append(float(i))
 
     if len(X_rows) < 6:
         raise ValueError("Not enough valid feature rows for advanced prediction (need >= 6).")
 
-    X = np.array(X_rows, dtype=float)
+    X_feat = np.array(X_rows, dtype=float)
     y = np.array(y_vals, dtype=float)
-    t = np.arange(X.shape[0], dtype=float)
-    Z = _advanced_design(X, t, scale_used=scale_used)
-    w, *_ = np.linalg.lstsq(Z, y, rcond=None)
-    return w, dates, X
+    t = np.array(t_vals, dtype=float)
+
+    scale = (scale_used or "monthly").strip().lower()
+    if scale == "daily":
+        X_time = _time_basis(t, periods=[7.0, 30.0, 365.25], trend_degree=1)
+        alpha = 50.0
+    elif scale == "yearly":
+        X_time = _time_basis(t, periods=[], trend_degree=1)
+        alpha = 1.0
+    else:
+        X_time = _time_basis(t, periods=[12.0], trend_degree=1)
+        alpha = 1.0
+
+    X = np.hstack([X_time, X_feat])
+    w = _ridge_solve(X, y, alpha=alpha)
+    return w, dates, X_feat, t
 
 
 def _advanced_predict_monthly(points: List[Dict[str, Any]], feature_cols: List[str], horizon_months: int) -> List[Dict[str, Any]]:
-    w, dates, X = _advanced_fit(points, feature_cols, scale_used="monthly")
-    t = np.arange(X.shape[0], dtype=float)
-    Z = _advanced_design(X, t, scale_used="monthly")
-    y_hat = (Z @ w).tolist()
-    last_feats = X[-1, :]
-    future_X = np.tile(last_feats, (horizon_months, 1))
-    future_t = np.arange(X.shape[0], X.shape[0] + horizon_months, dtype=float)
-    future_Z = _advanced_design(future_X, future_t, scale_used="monthly")
-    future_y = (future_Z @ w).tolist()
+    w, dates, X_feat, t = _advanced_fit(points, feature_cols, scale_used="monthly")
+    X_time = _time_basis(t, periods=[12.0], trend_degree=1)
+    X = np.hstack([X_time, X_feat])
+    y_hat = (X @ w).tolist()
+    last_feats = X_feat[-1, :].copy()
+    ft = np.arange(len(t), len(t) + horizon_months, dtype=float)
+    Xf_time = _time_basis(ft, periods=[12.0], trend_degree=1)
+    Xf_feat = np.tile(last_feats, (horizon_months, 1))
+    Xf = np.hstack([Xf_time, Xf_feat])
+    future_y = (Xf @ w).tolist()
     last_date = dates[-1]
     future_dates = [_month_add(last_date, i) for i in range(1, horizon_months + 1)]
     out: List[Dict[str, Any]] = []
@@ -228,16 +271,38 @@ def _advanced_predict_monthly(points: List[Dict[str, Any]], feature_cols: List[s
     return out
 
 
+def _advanced_predict_yearly(points: List[Dict[str, Any]], feature_cols: List[str], horizon_years: int) -> List[Dict[str, Any]]:
+    w, dates, X_feat, t = _advanced_fit(points, feature_cols, scale_used="yearly")
+    X_time = _time_basis(t, periods=[], trend_degree=1)
+    X = np.hstack([X_time, X_feat])
+    y_hat = (X @ w).tolist()
+    last_feats = X_feat[-1, :].copy()
+    ft = np.arange(len(t), len(t) + horizon_years, dtype=float)
+    Xf_time = _time_basis(ft, periods=[], trend_degree=1)
+    Xf_feat = np.tile(last_feats, (horizon_years, 1))
+    Xf = np.hstack([Xf_time, Xf_feat])
+    future_y = (Xf @ w).tolist()
+    last_date = dates[-1]
+    future_dates = [_year_add(last_date, i) for i in range(1, horizon_years + 1)]
+    out: List[Dict[str, Any]] = []
+    for i, d in enumerate(dates):
+        out.append({"date": d, "value": float(y_hat[i]), "kind": "fitted"})
+    for i in range(horizon_years):
+        out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
+    return out
+
+
 def _advanced_predict_daily(points: List[Dict[str, Any]], feature_cols: List[str], horizon_days: int) -> List[Dict[str, Any]]:
-    w, dates, X = _advanced_fit(points, feature_cols, scale_used="daily")
-    t = np.arange(X.shape[0], dtype=float)
-    Z = _advanced_design(X, t, scale_used="daily")
-    y_hat = (Z @ w).tolist()
-    last_feats = X[-1, :]
-    future_X = np.tile(last_feats, (horizon_days, 1))
-    future_t = np.arange(X.shape[0], X.shape[0] + horizon_days, dtype=float)
-    future_Z = _advanced_design(future_X, future_t, scale_used="daily")
-    future_y = (future_Z @ w).tolist()
+    w, dates, X_feat, t = _advanced_fit(points, feature_cols, scale_used="daily")
+    X_time = _time_basis(t, periods=[7.0, 30.0, 365.25], trend_degree=1)
+    X = np.hstack([X_time, X_feat])
+    y_hat = (X @ w).tolist()
+    last_feats = X_feat[-1, :].copy()
+    ft = np.arange(len(t), len(t) + horizon_days, dtype=float)
+    Xf_time = _time_basis(ft, periods=[7.0, 30.0, 365.25], trend_degree=1)
+    Xf_feat = np.tile(last_feats, (horizon_days, 1))
+    Xf = np.hstack([Xf_time, Xf_feat])
+    future_y = (Xf @ w).tolist()
     last_date = dates[-1]
     future_dates = [_day_add(last_date, i) for i in range(1, horizon_days + 1)]
     out: List[Dict[str, Any]] = []
@@ -254,19 +319,19 @@ def _advanced_predict_monthly_with_future_features(
     horizon_months: int,
     future_features: Dict[str, float],
 ) -> List[Dict[str, Any]]:
-    w, dates, X = _advanced_fit(points, feature_cols, scale_used="monthly")
-    t = np.arange(X.shape[0], dtype=float)
-    Z = _advanced_design(X, t, scale_used="monthly")
-    y_hat = (Z @ w).tolist()
-    last_feats = X[-1, :].copy()
+    w, dates, X_feat, t = _advanced_fit(points, feature_cols, scale_used="monthly")
+    X_time = _time_basis(t, periods=[12.0], trend_degree=1)
+    X = np.hstack([X_time, X_feat])
+    y_hat = (X @ w).tolist()
+    last_feats = X_feat[-1, :].copy()
     for i, col in enumerate(feature_cols):
         if col in future_features:
             last_feats[i] = float(future_features[col])
-
-    future_X = np.tile(last_feats, (horizon_months, 1))
-    future_t = np.arange(X.shape[0], X.shape[0] + horizon_months, dtype=float)
-    future_Z = _advanced_design(future_X, future_t, scale_used="monthly")
-    future_y = (future_Z @ w).tolist()
+    ft = np.arange(len(t), len(t) + horizon_months, dtype=float)
+    Xf_time = _time_basis(ft, periods=[12.0], trend_degree=1)
+    Xf_feat = np.tile(last_feats, (horizon_months, 1))
+    Xf = np.hstack([Xf_time, Xf_feat])
+    future_y = (Xf @ w).tolist()
     last_date = dates[-1]
     future_dates = [_month_add(last_date, i) for i in range(1, horizon_months + 1)]
     out: List[Dict[str, Any]] = []
@@ -277,25 +342,54 @@ def _advanced_predict_monthly_with_future_features(
     return out
 
 
+def _advanced_predict_yearly_with_future_features(
+    points: List[Dict[str, Any]],
+    feature_cols: List[str],
+    horizon_years: int,
+    future_features: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    w, dates, X_feat, t = _advanced_fit(points, feature_cols, scale_used="yearly")
+    X_time = _time_basis(t, periods=[], trend_degree=1)
+    X = np.hstack([X_time, X_feat])
+    y_hat = (X @ w).tolist()
+    last_feats = X_feat[-1, :].copy()
+    for i, col in enumerate(feature_cols):
+        if col in future_features:
+            last_feats[i] = float(future_features[col])
+    ft = np.arange(len(t), len(t) + horizon_years, dtype=float)
+    Xf_time = _time_basis(ft, periods=[], trend_degree=1)
+    Xf_feat = np.tile(last_feats, (horizon_years, 1))
+    Xf = np.hstack([Xf_time, Xf_feat])
+    future_y = (Xf @ w).tolist()
+    last_date = dates[-1]
+    future_dates = [_year_add(last_date, i) for i in range(1, horizon_years + 1)]
+    out: List[Dict[str, Any]] = []
+    for i, d in enumerate(dates):
+        out.append({"date": d, "value": float(y_hat[i]), "kind": "fitted"})
+    for i in range(horizon_years):
+        out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
+    return out
+
+
 def _advanced_predict_daily_with_future_features(
     points: List[Dict[str, Any]],
     feature_cols: List[str],
     horizon_days: int,
     future_features: Dict[str, float],
 ) -> List[Dict[str, Any]]:
-    w, dates, X = _advanced_fit(points, feature_cols, scale_used="daily")
-    t = np.arange(X.shape[0], dtype=float)
-    Z = _advanced_design(X, t, scale_used="daily")
-    y_hat = (Z @ w).tolist()
-    last_feats = X[-1, :].copy()
+    w, dates, X_feat, t = _advanced_fit(points, feature_cols, scale_used="daily")
+    X_time = _time_basis(t, periods=[7.0, 30.0, 365.25], trend_degree=1)
+    X = np.hstack([X_time, X_feat])
+    y_hat = (X @ w).tolist()
+    last_feats = X_feat[-1, :].copy()
     for i, col in enumerate(feature_cols):
         if col in future_features:
             last_feats[i] = float(future_features[col])
-
-    future_X = np.tile(last_feats, (horizon_days, 1))
-    future_t = np.arange(X.shape[0], X.shape[0] + horizon_days, dtype=float)
-    future_Z = _advanced_design(future_X, future_t, scale_used="daily")
-    future_y = (future_Z @ w).tolist()
+    ft = np.arange(len(t), len(t) + horizon_days, dtype=float)
+    Xf_time = _time_basis(ft, periods=[7.0, 30.0, 365.25], trend_degree=1)
+    Xf_feat = np.tile(last_feats, (horizon_days, 1))
+    Xf = np.hstack([Xf_time, Xf_feat])
+    future_y = (Xf @ w).tolist()
     last_date = dates[-1]
     future_dates = [_day_add(last_date, i) for i in range(1, horizon_days + 1)]
     out: List[Dict[str, Any]] = []
@@ -341,21 +435,170 @@ def _annotate_fit_test_kinds(baseline: List[Dict[str, Any]], *, n_history: int, 
     return out
 
 
+def _parse_predict_payload() -> Tuple[str, int, Optional[str], str, Dict[str, Any], Dict[str, Any] | None, Dict[str, Any] | None]:
+    payload = request.get_json(silent=True) or {}
+    upload_id = payload.get("upload_id")
+    if not upload_id:
+        raise ValueError("Missing field: upload_id")
+
+    horizon = payload.get("horizon_months", 12)
+    try:
+        horizon = int(horizon)
+    except Exception:
+        raise ValueError("horizon_months must be an integer")
+
+    mode_override = payload.get("mode_override")
+    if mode_override is not None and mode_override not in ("basic", "advanced"):
+        raise ValueError("mode_override must be 'basic' or 'advanced'")
+
+    physics_mode = (payload.get("physics_mode") or "none").strip().lower()
+    if physics_mode not in ("none", "non_negative", "smoothness", "cap", "full"):
+        raise ValueError("physics_mode must be one of: none, non_negative, smoothness, cap, full")
+
+    physics = payload.get("physics") or {}
+    if physics is None:
+        physics = {}
+    non_negative = bool(physics.get("non_negative", True))
+    max_change_rate = None
+    if "max_change_rate" in physics and physics.get("max_change_rate") is not None:
+        try:
+            max_change_rate = float(physics.get("max_change_rate"))
+        except Exception:
+            raise ValueError("physics.max_change_rate must be a number")
+
+    cap_value = None
+    if "cap_value" in physics and physics.get("cap_value") is not None:
+        try:
+            cap_value = float(physics.get("cap_value"))
+        except Exception:
+            raise ValueError("physics.cap_value must be a number or null")
+        if cap_value < 0:
+            raise ValueError("cap_value must be >= 0")
+
+    apply_to = (physics.get("apply_to") or "test_forecast").strip().lower()
+    if apply_to not in ("forecast", "test_forecast"):
+        raise ValueError("physics.apply_to must be 'forecast' or 'test_forecast'")
+
+    physics_user = {
+        "non_negative": non_negative,
+        "max_change_rate": max_change_rate,
+        "cap_value": cap_value,
+        "apply_to": apply_to,
+    }
+
+    disturbance = payload.get("disturbance")
+    evaluation = payload.get("evaluation")
+    return upload_id, horizon, mode_override, physics_mode, physics_user, disturbance, evaluation
+
+
+def _derive_physics_effective(
+    *,
+    physics_mode: str,
+    physics_user: Dict[str, Any],
+    scale_used: str,
+    history_y: List[float],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    mode = (physics_mode or "none").strip().lower()
+    scale = (scale_used or "monthly").strip().lower()
+    non_negative = bool(physics_user.get("non_negative", True))
+    mcr = physics_user.get("max_change_rate", None)
+    if mcr is None:
+        if scale == "daily":
+            mcr = 0.08
+            mcr_src = "auto_daily_default_0.08"
+        elif scale == "yearly":
+            mcr = 0.35
+            mcr_src = "auto_yearly_default_0.35"
+        else:
+            mcr = 0.20
+            mcr_src = "auto_monthly_default_0.20"
+    else:
+        mcr_src = "user"
+
+    try:
+        mcr = float(mcr)
+    except Exception:
+        mcr = 0.20 if scale not in ("daily", "yearly") else (0.08 if scale == "daily" else 0.35)
+        mcr_src = "auto_fallback"
+
+    if mcr < 0:
+        mcr = abs(mcr)
+        mcr_src = f"{mcr_src}_abs"
+    if mcr > 1.0:
+        mcr = 1.0
+        mcr_src = f"{mcr_src}_clamped_1.0"
+    cap_value = physics_user.get("cap_value", None)
+    cap_src = "user" if cap_value is not None else None
+
+    need_cap = mode in ("cap", "full")
+    if need_cap and cap_value is None:
+        ys = [float(v) for v in (history_y or []) if v is not None and np.isfinite(float(v))]
+        if len(ys) >= 3:
+            if scale == "daily":
+                cap_value = float(np.percentile(ys, 99.0) * 1.05)
+                cap_src = "auto_p99_x1.05"
+            elif scale == "yearly":
+                cap_value = float(np.percentile(ys, 95.0) * 1.05)
+                cap_src = "auto_p95_x1.05"
+            else:
+                cap_value = float(np.percentile(ys, 98.0) * 1.05)
+                cap_src = "auto_p98_x1.05"
+        else:
+            cap_value = None
+            cap_src = "auto_skipped_insufficient_history"
+
+    if cap_value is not None:
+        try:
+            cap_value = float(cap_value)
+            if cap_value < 0:
+                cap_value = abs(cap_value)
+                cap_src = f"{cap_src}_abs" if cap_src else "abs"
+        except Exception:
+            cap_value = None
+            cap_src = "auto_invalid_cap_value"
+
+    apply_to = (physics_user.get("apply_to") or "test_forecast").strip().lower()
+    if apply_to not in ("forecast", "test_forecast"):
+        apply_to = "test_forecast"
+
+    physics_effective = {
+        "physics_mode": mode,
+        "non_negative": non_negative,
+        "max_change_rate": float(mcr),
+        "cap_value": cap_value,
+        "apply_to": apply_to,
+    }
+    physics_sources = {
+        "non_negative": "user_or_default_true",
+        "max_change_rate": mcr_src,
+        "cap_value": cap_src if cap_src is not None else "not_used",
+        "apply_to": "user_or_default_test_forecast",
+    }
+    return physics_effective, physics_sources
+
+
 def _run_physics(
     baseline: List[Dict[str, Any]],
-    physics_params: Dict[str, Any],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+    physics_effective: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], Optional[str]]:
     piml, correction_summary = apply_physics_corrections(
         baseline,
-        physics_mode=physics_params["physics_mode"],
-        non_negative=physics_params["non_negative"],
-        max_change_rate=physics_params["max_change_rate"],
-        cap_value=physics_params["cap_value"],
-        apply_to=physics_params.get("apply_to", "test_forecast"),
+        physics_mode=physics_effective["physics_mode"],
+        non_negative=physics_effective["non_negative"],
+        max_change_rate=physics_effective["max_change_rate"],
+        cap_value=physics_effective.get("cap_value"),
+        apply_to=physics_effective.get("apply_to", "test_forecast"),
     )
     comparison = _compute_comparison(baseline, piml)
     delta_series = _build_delta_series(baseline, piml)
-    return piml, correction_summary, comparison, delta_series
+    why_no = None
+    try:
+        if int((correction_summary or {}).get("num_adjusted") or 0) == 0:
+            why_no = "No constraint violations under current physics params; correction skipped."
+    except Exception:
+        pass
+
+    return piml, correction_summary, comparison, delta_series, why_no
 
 
 @predictions_blueprint.route("/predict", methods=["POST"])
@@ -366,7 +609,7 @@ def create_prediction():
         return make_response(jsonify({"error": str(e)}), 401)
 
     try:
-        upload_id, horizon_raw, mode_override, physics_params, disturbance_raw, evaluation_raw = _parse_predict_payload()
+        upload_id, horizon_raw, mode_override, physics_mode, physics_user, disturbance_raw, evaluation_raw = _parse_predict_payload()
     except ValueError as e:
         return make_response(jsonify({"error": str(e)}), 400)
 
@@ -381,7 +624,6 @@ def create_prediction():
     feature_cols = schema.get("feature_cols", []) or []
     mode_detected = upload.get("mode_detected") or _detect_mode_from_upload(upload)
     scale_used = (upload.get("scale_used") or "monthly").strip().lower()
-
     if mode_override == "advanced" and mode_detected == "basic":
         return make_response(
             jsonify({"error": "mode_override='advanced' not allowed for a basic upload (no feature columns)."}),
@@ -408,37 +650,53 @@ def create_prediction():
 
     try:
         disturbance = validate_disturbance(disturbance_raw, mode_used=mode_used, feature_cols=feature_cols)
-        evaluation = validate_evaluation(evaluation_raw, n_points=len(points_sorted))
+        evaluation = validate_evaluation(evaluation_raw, n_points=len(points_sorted), scale_used=scale_used)
     except ValueError as e:
         return make_response(jsonify({"error": str(e)}), 400)
 
     n_history = int(len(points_sorted))
     observed = [{"date": p["date"], "value": float(p["y"]), "kind": "observed"} for p in points_sorted]
-    horizon_unit = "months" if scale_used == "monthly" else "days"
     horizon_steps = int(horizon_raw)
+    horizon_unit = "days" if scale_used == "daily" else ("years" if scale_used == "yearly" else "months")
+    history_y = [float(p["y"]) for p in points_sorted]
+    physics_effective, physics_sources = _derive_physics_effective(
+        physics_mode=physics_mode,
+        physics_user=physics_user,
+        scale_used=scale_used,
+        history_y=history_y,
+    )
 
+    # baseline fit/predict
     try:
         if scale_used == "monthly":
             if mode_used == "basic":
                 baseline_original = _basic_predict_monthly(points_sorted, horizon_steps)
-                method = "baseline_basic_trend_fourier_monthly"
+                method = "baseline_basic_timebasis_ridge_monthly"
             else:
                 baseline_original = _advanced_predict_monthly(points_sorted, feature_cols, horizon_steps)
-                method = "baseline_advanced_lr_features_time_fourier_monthly"
+                method = "baseline_advanced_ridge_timebasis_monthly"
         elif scale_used == "daily":
             if mode_used == "basic":
                 baseline_original = _basic_predict_daily(points_sorted, horizon_steps)
-                method = "baseline_basic_trend_fourier_daily"
+                method = "baseline_basic_timebasis_ridge_daily"
             else:
                 baseline_original = _advanced_predict_daily(points_sorted, feature_cols, horizon_steps)
-                method = "baseline_advanced_lr_features_time_fourier_daily"
+                method = "baseline_advanced_ridge_timebasis_daily"
+        elif scale_used == "yearly":
+            if mode_used == "basic":
+                baseline_original = _basic_predict_yearly(points_sorted, horizon_steps)
+                method = "baseline_basic_timebasis_ridge_yearly"
+            else:
+                baseline_original = _advanced_predict_yearly(points_sorted, feature_cols, horizon_steps)
+                method = "baseline_advanced_ridge_timebasis_yearly"
         else:
-            return make_response(jsonify({"error": "Unsupported scale. Use daily or monthly data."}), 400)
+            return make_response(jsonify({"error": "Unsupported scale. Use daily, monthly, or yearly data."}), 400)
     except ValueError as e:
         return make_response(jsonify({"error": str(e)}), 400)
     except Exception as e:
         return make_response(jsonify({"error": "Model fit/predict failed.", "details": str(e)}), 500)
 
+    # evaluation
     evaluation_out: Dict[str, Any] | None = None
     n_test = 0
     n_train = n_history
@@ -449,8 +707,9 @@ def create_prediction():
                 mode_used=mode_used,
                 feature_cols=feature_cols,
                 split_cfg=evaluation["split"],
-                physics_params=physics_params,
+                physics_effective=physics_effective,
                 apply_physics_fn=apply_physics_corrections,
+                scale_used=scale_used,
             )
             n_test = int(evaluation_out.get("n_test") or 0)
             n_train = int(evaluation_out.get("n_train") or (n_history - n_test))
@@ -460,8 +719,12 @@ def create_prediction():
             return make_response(jsonify({"error": "Evaluation failed.", "details": str(e)}), 500)
 
     baseline_original = _annotate_fit_test_kinds(baseline_original, n_history=n_history, n_test=n_test)
+
+    # physics correction
     try:
-        piml_original, correction_original, comparison_original, delta_original = _run_physics(baseline_original, physics_params)
+        piml_original, correction_original, comparison_original, delta_original, why_no_original = _run_physics(
+            baseline_original, physics_effective
+        )
         violations_original = correction_original.get("violations_series") or []
     except ValueError as e:
         return make_response(jsonify({"error": str(e)}), 400)
@@ -472,17 +735,17 @@ def create_prediction():
     original_physics = {
         "baseline": physical_metrics(
             baseline_original,
-            non_negative=bool(physics_params["non_negative"]),
-            max_change_rate=float(physics_params["max_change_rate"]),
-            cap_value=physics_params["cap_value"],
+            non_negative=bool(physics_effective["non_negative"]),
+            max_change_rate=float(physics_effective["max_change_rate"]),
+            cap_value=physics_effective.get("cap_value"),
             prev_value=prev_anchor,
             correction_summary=None,
         ),
         "piml": physical_metrics(
             piml_original,
-            non_negative=bool(physics_params["non_negative"]),
-            max_change_rate=float(physics_params["max_change_rate"]),
-            cap_value=physics_params["cap_value"],
+            non_negative=bool(physics_effective["non_negative"]),
+            max_change_rate=float(physics_effective["max_change_rate"]),
+            cap_value=physics_effective.get("cap_value"),
             prev_value=prev_anchor,
             correction_summary=correction_original,
         ),
@@ -490,7 +753,7 @@ def create_prediction():
 
     meta = {
         "scale_used": scale_used,
-        "apply_to": physics_params.get("apply_to", "test_forecast"),
+        "apply_to": physics_effective.get("apply_to", "test_forecast"),
         "n_history": n_history,
         "n_train": n_train,
         "n_test": n_test,
@@ -509,19 +772,33 @@ def create_prediction():
             "comparison": comparison_original,
             "correction_summary": correction_original,
             "physics": original_physics,
+            "physics_effective": physics_effective,
+            "physics_sources": physics_sources,
+            "why_no_correction": why_no_original,
         },
     }
 
+    # disturbance branch
     disturbance_summary: Dict[str, Any] | None = None
-
     if disturbance["enabled"]:
         try:
+            observed_disturbed: List[Dict[str, Any]] | None = None
+            disturbance_note = (
+                "Disturbed is a what-if scenario. Real observed history is unchanged; the disturbance affects the scenario inputs used to generate baseline and corrected series. "
+                "Accuracy is not scored because there is no ground truth for the disturbed future."
+            )
+
             if mode_used == "basic":
                 disturbed_points = apply_basic_disturbance(points_sorted, float(disturbance["global_pct"] or 0.0))
+                observed_disturbed = [{"date": p["date"], "value": float(p["y"]), "kind": "observed_disturbed"} for p in disturbed_points]
+
                 if scale_used == "monthly":
                     baseline_disturbed = _basic_predict_monthly(disturbed_points, horizon_steps)
-                else:
+                elif scale_used == "daily":
                     baseline_disturbed = _basic_predict_daily(disturbed_points, horizon_steps)
+                else:
+                    baseline_disturbed = _basic_predict_yearly(disturbed_points, horizon_steps)
+
                 disturbance_summary = {
                     "enabled": True,
                     "mode": "basic",
@@ -536,44 +813,50 @@ def create_prediction():
                 )
                 disturbance_summary["enabled"] = True
 
+                disturbance_note = (
+                    "Disturbed is a what-if scenario. Real observed history is unchanged. "
+                    "In advanced mode, disturbance modifies the future feature vector used for forecasting (history observations are not altered). "
+                    "Accuracy is not scored because there is no ground truth for the disturbed future."
+                )
+
                 if scale_used == "monthly":
                     baseline_disturbed = _advanced_predict_monthly_with_future_features(
-                        points_sorted,
-                        feature_cols,
-                        horizon_steps,
-                        future_features=future_feats,
+                        points_sorted, feature_cols, horizon_steps, future_features=future_feats
+                    )
+                elif scale_used == "daily":
+                    baseline_disturbed = _advanced_predict_daily_with_future_features(
+                        points_sorted, feature_cols, horizon_steps, future_features=future_feats
                     )
                 else:
-                    baseline_disturbed = _advanced_predict_daily_with_future_features(
-                        points_sorted,
-                        feature_cols,
-                        horizon_steps,
-                        future_features=future_feats,
+                    baseline_disturbed = _advanced_predict_yearly_with_future_features(
+                        points_sorted, feature_cols, horizon_steps, future_features=future_feats
                     )
 
             baseline_disturbed = _annotate_fit_test_kinds(baseline_disturbed, n_history=n_history, n_test=n_test)
-            piml_disturbed, correction_disturbed, comparison_disturbed, delta_disturbed = _run_physics(baseline_disturbed, physics_params)
+            piml_disturbed, correction_disturbed, comparison_disturbed, delta_disturbed, why_no_disturbed = _run_physics(
+                baseline_disturbed, physics_effective
+            )
             violations_disturbed = correction_disturbed.get("violations_series") or []
             disturbed_physics = {
                 "baseline": physical_metrics(
                     baseline_disturbed,
-                    non_negative=bool(physics_params["non_negative"]),
-                    max_change_rate=float(physics_params["max_change_rate"]),
-                    cap_value=physics_params["cap_value"],
+                    non_negative=bool(physics_effective["non_negative"]),
+                    max_change_rate=float(physics_effective["max_change_rate"]),
+                    cap_value=physics_effective.get("cap_value"),
                     prev_value=prev_anchor,
                     correction_summary=None,
                 ),
                 "piml": physical_metrics(
                     piml_disturbed,
-                    non_negative=bool(physics_params["non_negative"]),
-                    max_change_rate=float(physics_params["max_change_rate"]),
-                    cap_value=physics_params["cap_value"],
+                    non_negative=bool(physics_effective["non_negative"]),
+                    max_change_rate=float(physics_effective["max_change_rate"]),
+                    cap_value=physics_effective.get("cap_value"),
                     prev_value=prev_anchor,
                     correction_summary=correction_disturbed,
                 ),
             }
 
-            outputs["disturbed"] = {
+            out_disturbed: Dict[str, Any] = {
                 "meta": meta,
                 "baseline": baseline_disturbed,
                 "piml": piml_disturbed,
@@ -582,7 +865,15 @@ def create_prediction():
                 "comparison": comparison_disturbed,
                 "correction_summary": correction_disturbed,
                 "physics": disturbed_physics,
+                "physics_effective": physics_effective,
+                "physics_sources": physics_sources,
+                "why_no_correction": why_no_disturbed,
+                "disturbance_note": disturbance_note,
             }
+            if observed_disturbed is not None:
+                out_disturbed["observed_disturbed"] = observed_disturbed
+
+            outputs["disturbed"] = out_disturbed
 
         except ValueError as e:
             return make_response(jsonify({"error": str(e)}), 400)
@@ -601,7 +892,9 @@ def create_prediction():
             "horizon_months": horizon_raw,
             "horizon_unit": horizon_unit,
             "mode_override": mode_override,
-            "physics": physics_params,
+            "physics_user": {"physics_mode": physics_mode, **physics_user},
+            "physics_effective": physics_effective,
+            "physics_sources": physics_sources,
             "disturbance": disturbance,
             "evaluation": evaluation,
         },
@@ -609,9 +902,8 @@ def create_prediction():
         "evaluation": evaluation_out,
         "disturbance_summary": disturbance_summary,
         "limitations": [
-            "Horizon uses months for monthly data and days for daily data (API field name kept for compatibility).",
-            "Advanced baseline uses the last feature vector for forecasting; disturbance applies to the future feature vector.",
-            "Yearly data is rejected; daily and monthly are kept as is.",
+            "Horizon uses months for monthly data, days for daily data, and years for yearly data (API field name kept for compatibility).",
+            "Advanced baseline uses last feature vector for forecasting; disturbance applies to the future feature vector.",
             "PIML is implemented as a post-processing correction layer (no retraining).",
             "Disturbed scenarios are for what-if comparison, not accuracy scoring (no ground truth).",
         ],
@@ -656,7 +948,6 @@ def get_prediction(prediction_id: str):
         doc = db.predictions.find_one({"_id": ObjectId(prediction_id), "owner.user_id": user["user_id"]})
         if not doc:
             return make_response(jsonify({"error": "Prediction not found."}), 404)
-
         return make_response(
             jsonify(
                 {

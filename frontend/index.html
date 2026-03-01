@@ -87,31 +87,81 @@
                 <div id="horizonHint" class="card__hint" style="margin-top: 6px;">—</div>
               </label>
 
-              <label class="field">
-                <span class="field__label">Physics mode (post-processing)</span>
-                <select id="physicsMode" class="input">
-                  <option value="none">none</option>
-                  <option value="non_negative">non_negative</option>
-                  <option value="smoothness">smoothness</option>
-                  <option value="cap">cap</option>
-                  <option value="full" selected>full</option>
-                </select>
-              </label>
+              <!-- Physics -->
+              <div class="rules" style="margin-top: 10px;">
+                <div class="rules__title">Physics constraints (choose any)</div>
 
-              <label class="field field--inline">
-                <input id="nonNegativeToggle" type="checkbox" checked />
-                <span class="field__label">Enforce non-negative</span>
-              </label>
+                <div class="row" style="gap: 14px; align-items: center; flex-wrap: wrap;">
+                  <label class="field field--inline" style="margin: 0;">
+                    <input id="phyNonNeg" type="checkbox" checked />
+                    <span class="field__label">Non-negative</span>
+                  </label>
 
-              <label class="field">
-                <span class="field__label">Max change rate (smoothness)</span>
-                <input id="maxChangeRate" class="input" type="number" step="0.01" min="0" max="5" value="0.25" />
-              </label>
+                  <label class="field field--inline" style="margin: 0;">
+                    <input id="phySmooth" type="checkbox" checked />
+                    <span class="field__label">Smoothness (rate limit)</span>
+                  </label>
 
-              <label class="field">
-                <span class="field__label">Cap value (optional)</span>
-                <input id="capValue" class="input" type="number" step="0.01" placeholder="leave empty if not used" />
-              </label>
+                  <label class="field field--inline" style="margin: 0;">
+                    <input id="phyCap" type="checkbox" />
+                    <span class="field__label">Cap</span>
+                  </label>
+                </div>
+
+                <div class="rules__hint">Tip: selecting multiple constraints will be combined automatically.</div>
+              </div>
+
+              <!-- Apply-to -->
+              <div id="applyToField">
+                <label class="field">
+                  <span class="field__label">Apply-to</span>
+                  <select id="applyToSelect" class="input">
+                    <option value="forecast">Forecast only</option>
+                    <option value="test_forecast" selected>Test+Forecast</option>
+                  </select>
+                  <div class="card__hint" style="margin-top: 6px;">
+                    Use Forecast only if you want to avoid affecting evaluation on the test segment.
+                  </div>
+                </label>
+              </div>
+
+              <!-- smoothness group -->
+              <div id="smoothnessGroup">
+                <label class="field">
+                  <span class="field__label">Smoothness strength</span>
+                  <select id="smoothStrength" class="input">
+                    <option value="auto_normal" selected>Normal (auto)</option>
+                    <option value="auto_strict">Strict (auto)</option>
+                    <option value="auto_loose">Loose (auto)</option>
+                    <option value="custom">Custom</option>
+                  </select>
+                </label>
+
+                <div class="card__hint" style="margin-top: 6px;">
+                  Normal uses scale-aware defaults from the backend.
+                </div>
+
+                <label class="field" id="maxChangeRateField">
+                  <span class="field__label">Max change rate (custom only)</span>
+                  <input
+                    id="maxChangeRate"
+                    class="input"
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    max="5"
+                    placeholder="leave empty for auto"
+                  />
+                </label>
+              </div>
+
+              <!-- cap -->
+              <div id="capGroup" class="hidden">
+                <label class="field">
+                  <span class="field__label">Cap value (optional)</span>
+                  <input id="capValue" class="input" type="number" step="0.01" placeholder="leave empty if not used" />
+                </label>
+              </div>
 
               <hr class="sep" />
 

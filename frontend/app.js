@@ -18,11 +18,16 @@ const state = {
 function el(id) { return document.getElementById(id); }
 function show(node) { if (node) node.classList.remove("hidden"); }
 function hide(node) { if (node) node.classList.add("hidden"); }
-
 function setText(id, text) {
   const node = el(id);
   if (!node) return;
   node.textContent = text;
+}
+
+function setHtml(id, html) {
+  const node = el(id);
+  if (!node) return;
+  node.innerHTML = html;
 }
 
 function jsonPretty(obj) { return JSON.stringify(obj, null, 2); }
@@ -43,7 +48,7 @@ function setStatus(boxId, text, isError = false) {
 
 function getJsonHeaders() { return { "Content-Type": "application/json" }; }
 
-/* Horizon UI */
+/* Horizon */
 function buildHorizonOptions(scale) {
   const s = String(scale || "monthly").toLowerCase();
   if (s === "daily") {
@@ -51,6 +56,14 @@ function buildHorizonOptions(scale) {
       { value: 30, label: "30 days" },
       { value: 60, label: "60 days" },
       { value: 90, label: "90 days" },
+    ];
+  }
+  if (s === "yearly") {
+    return [
+      { value: 5, label: "5 years" },
+      { value: 10, label: "10 years" },
+      { value: 20, label: "20 years" },
+      { value: 30, label: "30 years" },
     ];
   }
   return [
@@ -86,9 +99,11 @@ function refreshHorizonSelect({ keepValue = true } = {}) {
 
   const hint = el("horizonHint");
   if (hint) {
-    hint.textContent = String(scale).toLowerCase() === "daily"
-      ? "Daily data: horizon is measured in days."
-      : "Monthly data: horizon is measured in months.";
+    const s = String(scale).toLowerCase();
+    hint.textContent =
+      s === "daily" ? "Daily data: horizon is measured in days."
+      : (s === "yearly" ? "Yearly data: horizon is measured in years."
+      : "Monthly data: horizon is measured in months.");
   }
 }
 
@@ -96,7 +111,7 @@ function resetHorizonToDefault() {
   const sel = el("horizonSelect");
   if (!sel) return;
   const scale = String(state.scaleUsed || "monthly").toLowerCase();
-  sel.value = scale === "daily" ? "60" : "12";
+  sel.value = scale === "daily" ? "60" : (scale === "yearly" ? "10" : "12");
 }
 
 /* Auth0 */
@@ -307,15 +322,12 @@ function refreshAuthUI() {
   }
 }
 
-/* API fetch */
+/* API */
 async function apiFetch(path, options = {}) {
   if (!state.auth0) throw new Error("Auth0 not ready. Check config.js and SDK loading.");
-
   await ensureTokenInteractive();
-
   const headers = new Headers(options.headers || {});
   headers.set("Authorization", `Bearer ${state.token}`);
-
   const isForm = options.body && options.body instanceof FormData;
   if (!isForm) {
     if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
@@ -356,12 +368,9 @@ function inferFrontMode(uploadResp) {
 function rebuildDisturbUI() {
   const enabled = el("disturbEnabled")?.checked;
   if (!el("disturbPanel")) return;
-
   el("disturbPanel").classList.toggle("disabled", !enabled);
-
   hide(el("basicDisturb"));
   hide(el("advancedDisturb"));
-
   if (!enabled) return;
   if (!state.modeDetected) return;
   if (state.modeDetected === "basic") {
@@ -392,14 +401,12 @@ function buildFeatureSliders(cols) {
     const label = document.createElement("div");
     label.className = "sliderRow__label";
     label.textContent = `${c} change (%)`;
-
     const slider = document.createElement("input");
     slider.type = "range";
     slider.min = "-20";
     slider.max = "20";
     slider.value = "0";
     slider.dataset.feature = c;
-
     const valueBox = document.createElement("div");
     valueBox.className = "sliderRow__value";
     valueBox.textContent = "0%";
@@ -442,10 +449,8 @@ function buildFeatureSliders(cols) {
 
     inputLine.appendChild(inputLabel);
     inputLine.appendChild(input);
-
     host.appendChild(wrap);
     host.appendChild(inputLine);
-
     const hr = document.createElement("div");
     hr.style.height = "1px";
     hr.style.background = "rgba(255,255,255,0.10)";
@@ -505,37 +510,91 @@ function readEvaluation() {
   return { enabled: true, split: { mode: "ratio", test_ratio: 0.2 } };
 }
 
+/* Physics UI */
+function updatePhysicsUI() {
+  const smooth = !!el("phySmooth")?.checked;
+  const cap = !!el("phyCap")?.checked;
+
+  if (smooth) show(el("smoothnessGroup"));
+  else hide(el("smoothnessGroup"));
+
+  if (cap) show(el("capGroup"));
+  else hide(el("capGroup"));
+
+  syncPhysicsUi();
+}
+
+function syncPhysicsUi() {
+  const strength = el("smoothStrength");
+  const mcr = el("maxChangeRate");
+  const smooth = !!el("phySmooth")?.checked;
+  if (!strength || !mcr) return;
+
+  const preset = String(strength.value || "auto_normal").toLowerCase();
+  const allowCustom = smooth && preset === "custom";
+
+  mcr.disabled = !allowCustom;
+  if (!allowCustom) mcr.value = "";
+}
+
+function smoothnessPresetRate(preset, scaleUsed) {
+  const s = String(scaleUsed || "monthly").toLowerCase();
+  const p = String(preset || "auto_normal").toLowerCase();
+
+  if (p === "auto_strict") return s === "daily" ? 0.05 : (s === "yearly" ? 0.20 : 0.10);
+  if (p === "auto_loose") return s === "daily" ? 0.12 : (s === "yearly" ? 0.55 : 0.35);
+  return null;
+}
+
 function readPhysics() {
-  const physicsMode = el("physicsMode")?.value;
-  const nonNegative = el("nonNegativeToggle")?.checked;
-  const maxChangeRate = Number(el("maxChangeRate")?.value || 0.25);
+  const nonNeg = !!el("phyNonNeg")?.checked;
+  const smooth = !!el("phySmooth")?.checked;
+  const cap = !!el("phyCap")?.checked;
+  let physicsMode = "none";
+  if (cap && smooth) physicsMode = "full";
+  else if (cap) physicsMode = "cap";
+  else if (smooth) physicsMode = "smoothness";
+  else if (nonNeg) physicsMode = "non_negative";
+
+  const applyTo = String(el("applyToSelect")?.value || "test_forecast").toLowerCase();
   const capRaw = el("capValue")?.value;
   const capValue = capRaw === "" ? null : Number(capRaw);
-
-  return {
-    physics_mode: physicsMode,
-    physics: {
-      non_negative: !!nonNegative,
-      max_change_rate: maxChangeRate,
-      cap_value: capValue,
-      apply_to: "test_forecast",
-    },
+  const physics = {
+    non_negative: nonNeg,
+    cap_value: capValue,
+    apply_to: applyTo,
   };
+
+  if (smooth) {
+    const preset = String(el("smoothStrength")?.value || "auto_normal").toLowerCase();
+
+    if (preset === "custom") {
+      const raw = String(el("maxChangeRate")?.value || "").trim();
+      if (raw !== "") {
+        const v = Number(raw);
+        if (Number.isFinite(v)) physics.max_change_rate = v;
+      }
+    } else {
+      const v = smoothnessPresetRate(preset, state.scaleUsed || "monthly");
+      if (v !== null) physics.max_change_rate = v;
+    }
+  }
+
+  return { physics_mode: physicsMode, physics };
 }
 
 /* Predict */
 async function runPrediction() {
   if (!state.uploadId) throw new Error("Please upload a CSV first.");
-
   const horizon = Number(el("horizonSelect")?.value);
   const disturbance = readDisturbance();
   const evaluation = readEvaluation();
-  const physics = readPhysics();
+  const phy = readPhysics();
   const payload = {
     upload_id: state.uploadId,
-    horizon_months: horizon, 
-    physics_mode: physics.physics_mode,
-    physics: physics.physics,
+    horizon_months: horizon,
+    physics_mode: phy.physics_mode,
+    physics: phy.physics,
     disturbance,
     evaluation,
     scenario_name: el("scenarioName")?.value || "",
@@ -585,7 +644,8 @@ function pickBlock(doc, view) {
   const outputs = doc.outputs || {};
   const observed = outputs.observed || [];
   const block = outputs[view] || outputs.original || {};
-  return { observed, block };
+  const observedDisturbed = (view === "disturbed" && block && block.observed_disturbed) ? block.observed_disturbed : null;
+  return { observed, observedDisturbed, block };
 }
 
 function buildSegmentDateSets(observed, meta) {
@@ -615,6 +675,32 @@ function filterSeriesBySegment(series, segment, segSets) {
     }
   }
   return out;
+}
+
+function renderHints(doc, view) {
+  const viewBox = el("viewHintBox");
+  const whyBox = el("whyNoBox");
+  if (!viewBox || !whyBox) return;
+  const outputs = doc?.outputs || {};
+  const block = outputs[view] || outputs.original || {};
+
+  if (view === "disturbed") {
+    const note = block.disturbance_note || "Disturbed is a what-if scenario. Real observed history is unchanged; the disturbance affects the scenario inputs used to generate baseline and corrected series. Accuracy is not scored because there is no ground truth for the disturbed future.";
+    setHtml("viewHintBox", note);
+    show(viewBox);
+  } else {
+    hide(viewBox);
+    setHtml("viewHintBox", "");
+  }
+
+  const why = block.why_no_correction;
+  if (why) {
+    setText("whyNoBox", why);
+    show(whyBox);
+  } else {
+    hide(whyBox);
+    setText("whyNoBox", "");
+  }
 }
 
 /* plotting */
@@ -733,7 +819,6 @@ function drawViolations(canvas, violSeries) {
   const w = canvas.width;
   const h = canvas.height;
   ctx.clearRect(0, 0, w, h);
-
   const pad = { l: 110, r: 16, t: 18, b: 26 };
   const innerW = w - pad.l - pad.r;
   const innerH = h - pad.t - pad.b;
@@ -810,15 +895,16 @@ function exportCsv() {
   if (!state.lastResponse) return;
 
   const view = el("viewSelect")?.value || "original";
-  const { observed, block } = pickBlock(state.lastResponse, view);
+  const { observed, observedDisturbed, block } = pickBlock(state.lastResponse, view);
   const meta = block.meta || {};
   const segSets = buildSegmentDateSets(observed, meta);
   const baseline = filterSeriesBySegment(block.baseline || [], state.activeSegment, segSets);
   const piml = filterSeriesBySegment(block.piml || [], state.activeSegment, segSets);
   const obs = filterSeriesBySegment(observed || [], state.activeSegment, segSets);
+  const obsD = observedDisturbed ? filterSeriesBySegment(observedDisturbed || [], state.activeSegment, segSets) : null;
   const map = new Map();
   function add(series, key) {
-    series.forEach((p) => {
+    (series || []).forEach((p) => {
       const d = p.date;
       if (!map.has(d)) map.set(d, { date: d });
       map.get(d)[key] = Number(p.value);
@@ -826,17 +912,21 @@ function exportCsv() {
   }
 
   add(obs, "observed");
+  if (obsD) add(obsD, "observed_disturbed");
   add(baseline, "baseline");
   add(piml, "piml");
 
   const dates = Array.from(map.keys()).sort();
-  const lines = ["date,observed,baseline,piml"];
+  const header = obsD ? "date,observed,observed_disturbed,baseline,piml" : "date,observed,baseline,piml";
+  const lines = [header];
+
   dates.forEach((d) => {
     const r = map.get(d);
     const o = r.observed ?? "";
+    const od = obsD ? (r.observed_disturbed ?? "") : null;
     const b = r.baseline ?? "";
     const p = r.piml ?? "";
-    lines.push(`${d},${o},${b},${p}`);
+    lines.push(obsD ? `${d},${o},${od},${b},${p}` : `${d},${o},${b},${p}`);
   });
 
   downloadText(`series_${view}_${state.activeSegment}.csv`, lines.join("\n"), "text/csv");
@@ -887,19 +977,19 @@ function renderResults(doc) {
   setText("methodBox", doc.method || "—");
   setText("scaleBox", doc.scale_used || "—");
 
-  const applyTo = doc.params?.physics?.apply_to || doc.params?.physics?.applyTo || "test_forecast";
+  const applyTo = doc.params?.physics_effective?.apply_to
+    || doc.params?.physics?.apply_to
+    || doc.params?.physics?.applyTo
+    || "test_forecast";
   setText("applyToBox", applyTo);
-
   setText("rawBox", jsonPretty(doc));
 
   const hasEval = !!doc.evaluation && !!doc.evaluation.metrics;
   if (hasEval) {
     const b = doc.evaluation.metrics.baseline?.accuracy || {};
     const p = doc.evaluation.metrics.piml?.accuracy || {};
-
     setText("kpiBaseErr", `RMSE ${fmtNum(b.rmse)} | MAE ${fmtNum(b.mae)} | MAPE ${fmtNum(b.mape)}`);
     setText("kpiPimlErr", `RMSE ${fmtNum(p.rmse)} | MAE ${fmtNum(p.mae)} | MAPE ${fmtNum(p.mape)}`);
-
     const improve = b.rmse && p.rmse ? ((b.rmse - p.rmse) / Math.max(b.rmse, 1e-9)) * 100 : null;
     setText("kpiImprove", improve === null ? "—" : `${fmtNum(improve, 1)}%`);
   } else {
@@ -918,22 +1008,95 @@ function renderResults(doc) {
 
   setActiveTab("compare");
   setActiveSegment("test_forecast");
-
   drawActiveView();
   setStatus("resultsStatus", "Loaded.", false);
+}
+
+const PLOT_EPS = 1e-6; 
+const HIDE_PIML_IN_FIT = true; 
+const SHOW_PIML_ONLY_WHEN_DIFF = true; 
+
+function _toMap(series) {
+  const m = new Map();
+  (series || []).forEach((p) => {
+    if (!p || !p.date) return;
+    m.set(p.date, Number(p.value));
+  });
+  return m;
+}
+
+function _maskedPimlSeries(pimlSeries, baseSeries, eps = PLOT_EPS) {
+  const bm = _toMap(baseSeries);
+  const out = [];
+  for (const p of pimlSeries || []) {
+    const pv = Number(p.value);
+    const bv = bm.has(p.date) ? bm.get(p.date) : NaN;
+    const diff = Number.isFinite(pv) && Number.isFinite(bv) ? Math.abs(pv - bv) : NaN;
+    if (Number.isFinite(diff) && diff <= eps) out.push({ ...p, value: NaN });
+    else out.push({ ...p, value: pv });
+  }
+  return out;
+}
+
+function _hasAnyVisiblePoint(series) {
+  for (const p of series || []) {
+    const v = Number(p?.value);
+    if (Number.isFinite(v)) return true;
+  }
+  return false;
+}
+
+function _calcAdjustStatsForSegment(baseSeries, pimlSeries, eps = PLOT_EPS) {
+  const bm = _toMap(baseSeries);
+  let n = 0;
+  let sumAbs = 0.0;
+  let nBoth = 0;
+
+  for (const p of pimlSeries || []) {
+    const pv = Number(p.value);
+    const bv = bm.has(p.date) ? bm.get(p.date) : NaN;
+    if (!Number.isFinite(pv) || !Number.isFinite(bv)) continue;
+    nBoth += 1;
+    const d = Math.abs(pv - bv);
+    if (d > eps) {
+      n += 1;
+      sumAbs += d;
+    }
+  }
+
+  const meanAbs = n > 0 ? (sumAbs / n) : 0.0;
+  const ratio = nBoth > 0 ? (n / nBoth) : 0.0;
+  return { n_adjusted: n, n_total: nBoth, adjusted_ratio: ratio, mean_abs_adjustment: meanAbs };
+}
+
+function _getPhysMode(doc) {
+  const physMode =
+    doc?.params?.physics_effective?.physics_mode ||
+    doc?.params?.physics_effective?.physicsMode ||
+    doc?.params?.physics_mode ||
+    doc?.params?.physicsMode ||
+    doc?.physics_mode ||
+    doc?.physicsMode ||
+    "unknown";
+  return String(physMode || "unknown").toLowerCase();
 }
 
 function drawActiveView() {
   if (!state.lastResponse) return;
 
   const view = el("viewSelect")?.value || "original";
-  const { observed, block } = pickBlock(state.lastResponse, view);
+  renderHints(state.lastResponse, view);
+
+  const { observed, observedDisturbed, block } = pickBlock(state.lastResponse, view);
   const meta = block.meta || {};
   const segSets = buildSegmentDateSets(observed, meta);
   const obsSeg = filterSeriesBySegment(observed, state.activeSegment, segSets);
+  const obsDSeg = observedDisturbed ? filterSeriesBySegment(observedDisturbed, state.activeSegment, segSets) : null;
   const baseSeg = filterSeriesBySegment(block.baseline || [], state.activeSegment, segSets);
-  const pimlSeg = filterSeriesBySegment(block.piml || [], state.activeSegment, segSets);
+  const pimlSegRaw = filterSeriesBySegment(block.piml || [], state.activeSegment, segSets);
   const violSeg = filterSeriesBySegment(block.violations_series || [], state.activeSegment, segSets);
+
+  // Physics KPI
   const byRule = {};
   for (const p of violSeg) {
     const rules = p.rules_hit || [];
@@ -942,12 +1105,52 @@ function drawActiveView() {
   const parts = ["non_negative", "cap", "rate_limit", "spike_clip"].map((r) => `${r} ${byRule[r] || 0}`);
   setText("kpiPhys", `B vs P shown by rule hits: ${parts.join(", ")}`);
 
+  const cs = block.correction_summary || {};
+  const numAdj = (cs.num_adjusted ?? cs.n_adjusted_points);
+  const ratio = (cs.adjusted_ratio ?? cs.adjustedRatio);
+  const meanAbs = (cs.mean_abs_adjustment ?? cs.meanAbsAdjustment);
+  const ratioText = (ratio !== null && ratio !== undefined) ? `${fmtNum(Number(ratio) * 100, 1)}%` : "—";
+  setText("kpiAdjPts", (numAdj === null || numAdj === undefined) ? "—" : `${numAdj} (${ratioText})`);
+  setText("kpiAdjMean", (meanAbs === null || meanAbs === undefined) ? "—" : fmtNum(meanAbs));
+  const segStats = _calcAdjustStatsForSegment(baseSeg, pimlSegRaw, PLOT_EPS);
+  const segRatioText = `${fmtNum(segStats.adjusted_ratio * 100, 1)}%`;
+  setText("kpiAdjPtsSeg", `In current view (segment): ${segStats.n_adjusted} (${segRatioText})`);
+  setText("kpiAdjMeanSeg", `In current view (segment): ${fmtNum(segStats.mean_abs_adjustment)}`);
+
+  const legendObsDist = el("legendObsDisturbed");
+  if (legendObsDist) {
+    if (view === "disturbed" && obsDSeg && obsDSeg.length) show(legendObsDist);
+    else hide(legendObsDist);
+  }
+
   if (state.activeTab === "compare") {
-    drawLineChart(el("compareChart"), [
+    const series = [
       { key: "obs", data: obsSeg.map((p) => ({ ...p, value: p.value })), stroke: "rgba(255,255,255,0.9)" },
-      { key: "base", data: baseSeg.map((p) => ({ ...p, value: p.value })), stroke: "rgba(58,123,253,0.95)" },
-      { key: "piml", data: pimlSeg.map((p) => ({ ...p, value: p.value })), stroke: "rgba(40,215,201,0.95)" },
-    ]);
+    ];
+
+    if (view === "disturbed" && obsDSeg && obsDSeg.length) {
+      series.push({ key: "obsD", data: obsDSeg.map((p) => ({ ...p, value: p.value })), stroke: "rgba(255,195,80,0.95)" });
+    }
+
+    series.push({ key: "base", data: baseSeg.map((p) => ({ ...p, value: p.value })), stroke: "rgba(58,123,253,0.95)" });
+    const seg = String(state.activeSegment || "test_forecast").toLowerCase();
+    const hideInFit = HIDE_PIML_IN_FIT && seg === "fit";
+    const physMode = _getPhysMode(state.lastResponse);
+    const backendSaysNoAdj = (numAdj !== null && numAdj !== undefined) ? (Number(numAdj) <= 0) : false;
+    const backendModeNone = physMode === "none";
+    let pimlToPlot = pimlSegRaw.map((p) => ({ ...p, value: p.value }));
+    if (SHOW_PIML_ONLY_WHEN_DIFF) {
+      pimlToPlot = _maskedPimlSeries(pimlToPlot, baseSeg, PLOT_EPS);
+    }
+
+    const hasVisible = _hasAnyVisiblePoint(pimlToPlot);
+    const shouldPlotPiml = !hideInFit && !backendModeNone && !backendSaysNoAdj && hasVisible;
+
+    if (shouldPlotPiml) {
+      series.push({ key: "piml", data: pimlToPlot, stroke: "rgba(40,215,201,0.95)" });
+    }
+
+    drawLineChart(el("compareChart"), series);
     return;
   }
 
@@ -955,7 +1158,6 @@ function drawActiveView() {
     const deltaSeg = filterSeriesBySegment(block.delta_series || [], state.activeSegment, segSets);
     drawDelta(el("deltaChart"), deltaSeg.map((p) => ({ date: p.date, value: p.delta, kind: p.kind })));
 
-    const cs = block.correction_summary || {};
     setText("deltaNum", cs.num_adjusted ?? "—");
     setText("deltaMax", cs.max_abs_adjustment !== undefined ? fmtNum(cs.max_abs_adjustment) : "—");
     setText("deltaMean", cs.mean_abs_adjustment !== undefined ? fmtNum(cs.mean_abs_adjustment) : "—");
@@ -966,7 +1168,6 @@ function drawActiveView() {
   const violFiltered = filterSeriesBySegment(block.violations_series || [], state.activeSegment, segSets);
   drawViolations(el("violChart"), violFiltered);
 
-  const cs = block.correction_summary || {};
   const br = cs.by_rule_counts || {};
   const msg = Object.keys(br).length
     ? Object.entries(br).map(([k, v]) => `${k}:${v}`).join(" | ")
@@ -978,6 +1179,11 @@ function drawActiveView() {
 function initSetupPage() {
   refreshHorizonSelect({ keepValue: false });
   resetHorizonToDefault();
+  ["phyNonNeg", "phySmooth", "phyCap"].forEach((id) => {
+    el(id)?.addEventListener("change", updatePhysicsUI);
+  });
+  el("smoothStrength")?.addEventListener("change", syncPhysicsUi);
+  updatePhysicsUI();
 
   el("uploadBtn")?.addEventListener("click", async () => {
     if (!state.authed) {
@@ -1000,7 +1206,6 @@ function initSetupPage() {
       if (!uploadId) throw new Error("Upload response missing upload_id.");
 
       const info = inferFrontMode(uploadResp);
-
       state.uploadId = uploadId;
       state.schema = info.schema;
       state.featureCols = info.featureCols;
@@ -1010,7 +1215,6 @@ function initSetupPage() {
       setText("uploadStatus", `Uploaded. ID: ${uploadId}`);
       setText("modeStatus", state.modeDetected);
       setText("scaleStatus", state.scaleUsed);
-
       refreshHorizonSelect({ keepValue: false });
       resetHorizonToDefault();
 
@@ -1022,6 +1226,7 @@ function initSetupPage() {
       }
 
       rebuildDisturbUI();
+      updatePhysicsUI();
       setStatus("runStatus", "Upload done. Configure settings and run.", false);
     } catch (err) {
       setText("uploadStatus", "Upload failed.");
@@ -1037,19 +1242,24 @@ function initSetupPage() {
     refreshHorizonSelect({ keepValue: false });
     resetHorizonToDefault();
 
-    if (el("physicsMode")) el("physicsMode").value = "full";
-    if (el("nonNegativeToggle")) el("nonNegativeToggle").checked = true;
-    if (el("maxChangeRate")) el("maxChangeRate").value = "0.25";
+    if (el("phyNonNeg")) el("phyNonNeg").checked = true;
+    if (el("phySmooth")) el("phySmooth").checked = true;
+    if (el("phyCap")) el("phyCap").checked = false;
+    if (el("applyToSelect")) el("applyToSelect").value = "test_forecast";
+    if (el("smoothStrength")) el("smoothStrength").value = "auto_normal";
+    if (el("maxChangeRate")) el("maxChangeRate").value = "";
     if (el("capValue")) el("capValue").value = "";
     if (el("disturbEnabled")) el("disturbEnabled").checked = false;
     if (el("globalPct")) el("globalPct").value = "0";
     if (el("globalPctInput")) el("globalPctInput").value = "0";
     setText("globalPctVal", "0");
+
     if (el("evalEnabled")) el("evalEnabled").checked = true;
     if (el("evalMode")) el("evalMode").value = "ratio";
     if (el("evalK")) el("evalK").value = "12";
 
     rebuildDisturbUI();
+    updatePhysicsUI();
     setStatus("runStatus", "Reset done.", false);
   });
 
@@ -1063,10 +1273,8 @@ function initSetupPage() {
     try {
       const resp = await runPrediction();
       cacheLastResponse(resp);
-
       const pid = resp.prediction_id;
       if (!pid) throw new Error("Missing prediction_id in response.");
-
       window.location.href = `./results.html?pid=${encodeURIComponent(pid)}`;
     } catch (err) {
       setStatus("runStatus", (err && err.message) || String(err), true);
@@ -1083,7 +1291,6 @@ async function initResultsPage() {
   const refreshBtn = el("refreshBtn");
   async function load(pid) {
     setStatus("resultsStatus", "Loading...", false);
-
     const cached = readCachedResponse(pid);
     if (cached) {
       renderResults(cached);
@@ -1096,14 +1303,11 @@ async function initResultsPage() {
   }
 
   viewSel?.addEventListener("change", () => { drawActiveView(); });
-
   el("tabCompare")?.addEventListener("click", () => setActiveTab("compare"));
   el("tabDelta")?.addEventListener("click", () => setActiveTab("delta"));
   el("tabViol")?.addEventListener("click", () => setActiveTab("viol"));
-
   const segBtns = document.querySelectorAll(".segbtn");
   segBtns.forEach((b) => { b.addEventListener("click", () => setActiveSegment(b.dataset.seg)); });
-
   el("exportJsonBtn")?.addEventListener("click", exportJson);
   el("exportCsvBtn")?.addEventListener("click", exportCsv);
 

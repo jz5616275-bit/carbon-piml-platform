@@ -9,14 +9,13 @@ def apply_basic_disturbance(points: List[Dict[str, Any]], global_pct: float) -> 
 
     out: List[Dict[str, Any]] = []
     for p in points:
-        out.append(
-            {
-                "date": p["date"],
-                "y": float(p["y"]) * m,
-                "features": p.get("features", {}) or {},
-            }
-        )
+        out.append({"date": p["date"], "y": float(p["y"]) * m, "features": p.get("features", {}) or {}})
     return out
+
+
+def build_basic_observed_whatif(points: List[Dict[str, Any]], global_pct: float) -> List[Dict[str, Any]]:
+    disturbed = apply_basic_disturbance(points, global_pct)
+    return [{"date": p["date"], "value": float(p["y"]), "kind": "observed_disturbed"} for p in disturbed]
 
 
 def build_advanced_future_features(
@@ -30,21 +29,13 @@ def build_advanced_future_features(
     for col in feature_cols:
         v0_any = (last_features or {}).get(col)
         if v0_any is None:
-            # If a feature is missing in the last row, keep it missing.
             continue
-
         v0 = float(v0_any)
-        pct_any = feature_pct.get(col, 0.0)
-        pct = float(pct_any)
+        pct = float(feature_pct.get(col, 0.0))
         v1 = v0 * (1.0 + pct)
-
         future[col] = v1
         if abs(pct) > 1e-12:
             applied[col] = {"from": v0, "pct": pct, "to": v1}
 
-    summary = {
-        "mode": "advanced",
-        "feature_pct": {k: float(v) for k, v in feature_pct.items()},
-        "applied": applied,
-    }
+    summary = {"mode": "advanced", "feature_pct": {k: float(v) for k, v in feature_pct.items()}, "applied": applied}
     return future, summary

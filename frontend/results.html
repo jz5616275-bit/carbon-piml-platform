@@ -5,13 +5,17 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>Carbon PIML Platform – Results</title>
     <link rel="stylesheet" href="./styles.css" />
+    <script src="./config.js"></script>
+
+    <!-- Auth0 SPA SDK (must be loaded before app.js initAuth) -->
+    <script src="https://cdn.auth0.com/js/auth0-spa-js/2.0/auth0-spa-js.production.js"></script>
   </head>
 
   <body data-page="results">
     <header class="topbar">
       <div class="brand">
         <div class="brand__title">Carbon PIML Platform</div>
-        <div class="brand__subtitle">Results (Baseline vs PIML)</div>
+        <div class="brand__subtitle">Results: Baseline vs PIML, segments, and exports.</div>
       </div>
 
       <nav class="topbar__actions">
@@ -21,164 +25,180 @@
           <button id="signupBtn" class="btn btn--ghost" type="button">Sign up</button>
           <button id="logoutBtn" class="btn btn--ghost hidden" type="button">Logout</button>
         </div>
-
-        <a class="btn btn--ghost" href="./index.html">Setup</a>
-        <a class="btn btn--ghost" href="./results.html">Results</a>
+        <a class="btn btn--ghost" href="./index.html">Back to Setup</a>
       </nav>
     </header>
 
     <main class="container">
-      <section class="page">
-        <div class="grid grid--2">
-          <div class="card">
-            <div class="card__title">Key numbers</div>
-            <div class="card__hint">History evaluation uses a holdout split (only where ground truth exists).</div>
+      <div id="resultsStatus" class="statusBox">Ready.</div>
 
-            <div class="kpis">
-              <div class="kpi">
-                <div class="kpi__label">Baseline error (test)</div>
-                <div class="kpi__value" id="kpiBaseErr">—</div>
-                <div class="kpi__sub">RMSE / MAE / MAPE</div>
-              </div>
-
-              <div class="kpi">
-                <div class="kpi__label">PIML error (test)</div>
-                <div class="kpi__value" id="kpiPimlErr">—</div>
-                <div class="kpi__sub">RMSE / MAE / MAPE</div>
-              </div>
-
-              <div class="kpi">
-                <div class="kpi__label">Improvement (RMSE)</div>
-                <div class="kpi__value" id="kpiImprove">—</div>
-                <div class="kpi__sub">((base - piml) / base) × 100</div>
-              </div>
-
-              <div class="kpi">
-                <div class="kpi__label">Violations (selected segment)</div>
-                <div class="kpi__value" id="kpiPhys">—</div>
-                <div class="kpi__sub">baseline vs piml</div>
-              </div>
-            </div>
-
-            <div class="status" style="margin-top: 12px;">
-              <div><span class="label">Prediction ID:</span> <span id="pidBox">—</span></div>
-              <div><span class="label">Mode:</span> <span id="modeBox">—</span></div>
-              <div><span class="label">Method:</span> <span id="methodBox">—</span></div>
-              <div><span class="label">Scale:</span> <span id="scaleBox">—</span></div>
-              <div><span class="label">Apply-to:</span> <span id="applyToBox">—</span></div>
-            </div>
-
-            <details class="details">
-              <summary>Show raw response</summary>
-              <pre id="rawBox" class="codebox">—</pre>
-            </details>
-
-            <div class="row row--end">
-              <button id="exportJsonBtn" class="btn btn--ghost" type="button">Export JSON</button>
-              <button id="exportCsvBtn" class="btn btn--ghost" type="button">Export CSV</button>
-            </div>
-
-            <div id="resultsStatus" class="runStatus" style="margin-top: 10px;">—</div>
+      <section class="grid grid--2">
+        <div class="card">
+          <div class="card__title">Run Summary</div>
+          <div class="kv">
+            <div class="kv__row"><div class="kv__k">Prediction ID</div><div class="kv__v" id="pidBox">—</div></div>
+            <div class="kv__row"><div class="kv__k">Mode</div><div class="kv__v" id="modeBox">—</div></div>
+            <div class="kv__row"><div class="kv__k">Method</div><div class="kv__v" id="methodBox">—</div></div>
+            <div class="kv__row"><div class="kv__k">Scale</div><div class="kv__v" id="scaleBox">—</div></div>
+            <div class="kv__row"><div class="kv__k">Apply-to</div><div class="kv__v" id="applyToBox">—</div></div>
           </div>
 
-          <div class="card">
-            <div class="card__title">Results</div>
-            <div class="card__hint">
-              Compare shows Observed vs Raw vs Corrected. Delta shows corrected − raw. Violations shows rule hits.
+          <div class="row" style="margin-top:12px; gap:10px; flex-wrap:wrap;">
+            <label class="card__hint" style="margin:0; width:auto;">View</label>
+            <select id="viewSelect" class="select">
+              <option value="original">Original</option>
+              <option value="disturbed">Disturbed</option>
+            </select>
+
+            <button id="refreshBtn" class="btn btn--ghost" type="button">Refresh</button>
+            <!-- Export buttons moved to Raw JSON section (below) -->
+          </div>
+
+          <div id="viewHintBox" class="hintBox hidden" style="margin-top:10px;"></div>
+          <div id="whyNoBox" class="hintBox hidden" style="margin-top:10px;"></div>
+        </div>
+
+        <div class="card">
+          <div class="card__title">KPIs (Holdout Test)</div>
+
+          <div class="kpiGrid">
+            <div class="kpi">
+              <div class="kpi__label">Baseline error</div>
+              <div class="kpi__value" id="kpiBaseErr">—</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi__label">PIML error</div>
+              <div class="kpi__value" id="kpiPimlErr">—</div>
+            </div>
+            <div class="kpi">
+              <div class="kpi__label">Improvement (RMSE)</div>
+              <div class="kpi__value" id="kpiImprove">—</div>
+            </div>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="kpiGrid">
+            <div class="kpi">
+              <div class="kpi__label">Adjusted points</div>
+              <div class="kpi__value" id="kpiAdjPts">—</div>
+              <!-- NEW: segment-linked -->
+              <div class="kpi__sub" id="kpiAdjPtsSeg">—</div>
             </div>
 
-            <!-- View selector -->
-            <div class="row row--tight">
-              <label class="field field--inline">
-                <span class="field__label">View:</span>
-                <select id="viewSelect" class="input input--sm">
-                  <option value="original" selected>original</option>
-                  <option value="disturbed">disturbed</option>
-                </select>
-              </label>
-              <div class="spacer"></div>
-              <button id="refreshBtn" class="btn btn--ghost" type="button">Refresh</button>
+            <div class="kpi">
+              <div class="kpi__label">Mean abs adjustment</div>
+              <div class="kpi__value" id="kpiAdjMean">—</div>
+              <!-- NEW: segment-linked -->
+              <div class="kpi__sub" id="kpiAdjMeanSeg">—</div>
             </div>
 
-            <!-- Tabs -->
-            <div class="tabbar" style="margin-top: 10px;">
-              <button class="tabbtn tabbtn--active" id="tabCompare" type="button">Compare</button>
-              <button class="tabbtn" id="tabDelta" type="button">Delta</button>
-              <button class="tabbtn" id="tabViol" type="button">Violations</button>
-            </div>
-
-            <!-- Segment buttons -->
-            <div class="segbar" style="margin-top: 10px;">
-              <button class="segbtn" data-seg="all" type="button">All</button>
-              <button class="segbtn" data-seg="fit" type="button">Fit</button>
-              <button class="segbtn" data-seg="test" type="button">Test</button>
-              <button class="segbtn" data-seg="forecast" type="button">Forecast</button>
-              <button class="segbtn segbtn--active" data-seg="test_forecast" type="button">Test+Forecast</button>
-            </div>
-
-            <!-- Compare -->
-            <div id="panelCompare">
-              <canvas id="compareChart" width="900" height="420" class="chart"></canvas>
-              <div class="legend">
-                <span class="dot dot--a"></span><span>Observed</span>
-                <span class="dot dot--b"></span><span>Raw (baseline)</span>
-                <span class="dot dot--c"></span><span>Corrected (PIML)</span>
-              </div>
-            </div>
-
-            <!-- Delta -->
-            <div id="panelDelta" class="hidden">
-              <div class="deltaCards">
-                <div class="deltaCard">
-                  <div class="deltaCard__label">num_adjusted</div>
-                  <div class="deltaCard__value" id="deltaNum">—</div>
-                </div>
-                <div class="deltaCard">
-                  <div class="deltaCard__label">max_abs_adjustment</div>
-                  <div class="deltaCard__value" id="deltaMax">—</div>
-                </div>
-                <div class="deltaCard">
-                  <div class="deltaCard__label">mean_abs_adjustment</div>
-                  <div class="deltaCard__value" id="deltaMean">—</div>
-                </div>
-                <div class="deltaCard">
-                  <div class="deltaCard__label">adjusted_ratio</div>
-                  <div class="deltaCard__value" id="deltaRatio">—</div>
-                </div>
-              </div>
-
-              <canvas id="deltaChart" width="900" height="320" class="chart chart--sm"></canvas>
-              <div class="card__hint" style="margin-top: 8px;">
-                Delta is computed as (corrected − raw) on the selected segment.
-              </div>
-            </div>
-
-            <!-- Violations -->
-            <div id="panelViol" class="hidden">
-              <div class="violCards">
-                <div class="violCard">
-                  <div class="violCard__label">Rule hits (selected segment)</div>
-                  <div class="violCard__value" id="violSummary">—</div>
-                  <div class="violCard__sub">by_rule_counts from correction_summary</div>
-                </div>
-              </div>
-
-              <canvas id="violChart" width="900" height="220" class="chart chart--sm"></canvas>
-              <div class="card__hint" style="margin-top: 8px;">
-                Markers indicate where rules were applied (non_negative / cap / rate_limit / spike_clip).
-              </div>
+            <div class="kpi">
+              <div class="kpi__label">Physics rule hits</div>
+              <div class="kpi__value" id="kpiPhys">—</div>
             </div>
           </div>
         </div>
+      </section>
 
-        <footer class="footer">
-          <span>Tip: run again from Setup to generate a new prediction id.</span>
-        </footer>
+      <section class="card" style="margin-top:16px;">
+        <div class="row" style="justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+          <div class="row" style="gap:10px; flex-wrap:wrap;">
+            <button id="tabCompare" class="tabbtn tabbtn--active" type="button">Compare</button>
+            <button id="tabDelta" class="tabbtn" type="button">Delta</button>
+            <button id="tabViol" class="tabbtn" type="button">Violations</button>
+          </div>
+
+          <div class="row" style="gap:10px; flex-wrap:wrap;">
+            <button class="segbtn segbtn--active" data-seg="test_forecast" type="button">Test+Forecast</button>
+            <button class="segbtn" data-seg="fit" type="button">Fit</button>
+            <button class="segbtn" data-seg="test" type="button">Test</button>
+            <button class="segbtn" data-seg="forecast" type="button">Forecast</button>
+            <button class="segbtn" data-seg="all" type="button">All</button>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div id="panelCompare">
+          <div class="legend">
+            <span class="legend__item"><span class="dot dot--white"></span>Observed</span>
+            <span id="legendObsDisturbed" class="legend__item hidden"><span class="dot dot--orange"></span>Observed (disturbed)</span>
+            <span class="legend__item"><span class="dot dot--blue"></span>Baseline</span>
+            <span class="legend__item"><span class="dot dot--cyan"></span>PIML</span>
+          </div>
+
+          <canvas id="compareChart" width="1040" height="420" style="width:100%; height:auto;"></canvas>
+        </div>
+
+        <div id="panelDelta" class="hidden">
+          <div class="row" style="gap:16px; flex-wrap:wrap; margin-bottom:10px;">
+            <div class="pill">Adjusted: <span id="deltaNum">—</span></div>
+            <div class="pill">Max abs: <span id="deltaMax">—</span></div>
+            <div class="pill">Mean abs: <span id="deltaMean">—</span></div>
+            <div class="pill">Ratio: <span id="deltaRatio">—</span></div>
+          </div>
+          <canvas id="deltaChart" width="1040" height="320" style="width:100%; height:auto;"></canvas>
+        </div>
+
+        <div id="panelViol" class="hidden">
+          <div class="row" style="gap:12px; flex-wrap:wrap; margin-bottom:10px;">
+            <div class="pill">Summary: <span id="violSummary">—</span></div>
+          </div>
+          <canvas id="violChart" width="1040" height="320" style="width:100%; height:auto;"></canvas>
+        </div>
+      </section>
+
+      <!-- Raw JSON (collapsible) + export buttons placed here -->
+      <section class="card" style="margin-top:16px;">
+        <div class="row" style="justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+          <div class="card__title" style="margin:0;">Raw JSON</div>
+          <div class="row" style="gap:10px; flex-wrap:wrap;">
+            <button id="exportJsonBtn" class="btn btn--ghost" type="button">Export JSON</button>
+            <button id="exportCsvBtn" class="btn btn--ghost" type="button">Export CSV</button>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <details>
+          <summary class="card__hint" style="cursor:pointer; margin:0;">Show / hide raw response</summary>
+          <pre id="rawBox" class="preBox" style="margin-top:10px;">{}</pre>
+        </details>
       </section>
     </main>
 
-    <script src="./config.js"></script>
-    <script defer src="https://cdn.auth0.com/js/auth0-spa-js/2.0/auth0-spa-js.production.js"></script>
     <script src="./app.js"></script>
+
+    <!-- Minimal inline styles for new KPI sub-lines; keep it tiny and non-invasive -->
+    <style>
+      .divider { height:1px; background: rgba(255,255,255,0.10); margin: 12px 0; }
+      .hintBox { padding:10px 12px; border:1px solid rgba(255,255,255,0.12); border-radius:10px; color: rgba(255,255,255,0.85); }
+      .kv { display:flex; flex-direction:column; gap:8px; margin-top:10px; }
+      .kv__row { display:flex; justify-content:space-between; gap:12px; }
+      .kv__k { color: rgba(255,255,255,0.60); }
+      .kv__v { color: rgba(255,255,255,0.92); font-weight: 600; }
+      .kpiGrid { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+      @media (max-width: 920px) { .kpiGrid { grid-template-columns: 1fr; } }
+      .kpi { padding: 10px 12px; border: 1px solid rgba(255,255,255,0.10); border-radius: 14px; }
+      .kpi__label { color: rgba(255,255,255,0.60); font-size: 12px; }
+      .kpi__value { color: rgba(255,255,255,0.92); font-weight: 700; margin-top: 6px; }
+      .kpi__sub { color: rgba(255,255,255,0.55); font-size: 12px; margin-top: 6px; }
+      .legend { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:10px; }
+      .legend__item { color: rgba(255,255,255,0.70); font-size: 12px; display:flex; align-items:center; gap:8px; }
+      .dot { width:10px; height:10px; border-radius: 50%; display:inline-block; background: rgba(255,255,255,0.8); }
+      .dot--white { background: rgba(255,255,255,0.9); }
+      .dot--orange { background: rgba(255,195,80,0.95); }
+      .dot--blue { background: rgba(58,123,253,0.95); }
+      .dot--cyan { background: rgba(40,215,201,0.95); }
+      .tabbtn { padding:8px 12px; border-radius: 12px; border:1px solid rgba(255,255,255,0.12); background: transparent; color: rgba(255,255,255,0.85); cursor:pointer; }
+      .tabbtn--active { background: rgba(255,255,255,0.10); }
+      .segbtn { padding:8px 10px; border-radius: 12px; border:1px solid rgba(255,255,255,0.12); background: transparent; color: rgba(255,255,255,0.85); cursor:pointer; }
+      .segbtn--active { background: rgba(255,255,255,0.10); }
+      .pill { padding: 6px 10px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.12); color: rgba(255,255,255,0.80); font-size: 12px; }
+      .preBox { background: rgba(0,0,0,0.2); padding: 12px; border-radius: 14px; border:1px solid rgba(255,255,255,0.10); overflow:auto; max-height: 320px; }
+      .statusBox { padding:10px 12px; border-radius: 12px; border:1px solid rgba(255,255,255,0.12); margin-bottom: 12px; color: rgba(255,255,255,0.85); }
+      .hidden { display:none !important; }
+    </style>
   </body>
 </html>
