@@ -63,6 +63,21 @@
               </ul>
               <div class="rules__hint">Tip: if you only provide date + value, the platform runs in basic mode.</div>
             </div>
+
+            <hr class="sep" />
+
+            <!-- Recent runs -->
+            <div class="rules rules--recent">
+              <div class="rules__title">Recent runs (last 5)</div>
+              <div class="rules__hint">Click any run to open Results.</div>
+
+              <div id="recentRunsStatus" class="card__hint">—</div>
+
+              <!-- NOTE: switched from <ul> to <div> for nicer card layout -->
+              <div id="recentRunsList" class="recentRunsList">
+                <div class="recentRuns__empty">Login to view recent runs.</div>
+              </div>
+            </div>
           </div>
 
           <!-- RIGHT: scenario / knobs -->
@@ -111,21 +126,7 @@
                 <div class="rules__hint">Tip: selecting multiple constraints will be combined automatically.</div>
               </div>
 
-              <!-- Apply-to -->
-              <div id="applyToField">
-                <label class="field">
-                  <span class="field__label">Apply-to</span>
-                  <select id="applyToSelect" class="input">
-                    <option value="forecast">Forecast only</option>
-                    <option value="test_forecast" selected>Test+Forecast</option>
-                  </select>
-                  <div class="card__hint" style="margin-top: 6px;">
-                    Use Forecast only if you want to avoid affecting evaluation on the test segment.
-                  </div>
-                </label>
-              </div>
-
-              <!-- smoothness group -->
+              <!-- smoothness -->
               <div id="smoothnessGroup">
                 <label class="field">
                   <span class="field__label">Smoothness strength</span>
@@ -226,7 +227,6 @@
         </div>
 
         <footer class="footer">
-          <span>Tip: after running, you will be redirected to Results with a prediction id.</span>
         </footer>
       </section>
     </main>

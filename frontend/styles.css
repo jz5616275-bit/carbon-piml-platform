@@ -600,3 +600,112 @@ a.btn {
   gap: 10px;
   align-items: center;
 }
+
+
+.recentRuns__empty {
+  padding: 12px 12px;
+  border: 1px dashed rgba(255,255,255,0.16);
+  border-radius: 12px;
+  color: rgba(255,255,255,0.72);
+  background: rgba(255,255,255,0.04);
+}
+
+#recentRunsList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.recentRun {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+
+  padding: 12px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.04);
+  text-decoration: none;
+
+  transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
+}
+
+.recentRun:hover {
+  transform: translateY(-1px);
+  background: rgba(255,255,255,0.06);
+  border-color: rgba(255,255,255,0.16);
+}
+
+.recentRun__left {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.recentRun__title {
+  color: rgba(255,255,255,0.92);
+  font-weight: 650;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 520px; 
+}
+
+.recentRun__meta {
+  color: rgba(255,255,255,0.62);
+  font-size: 12px;
+}
+
+.recentRun__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 1;
+  border: 1px solid rgba(255,255,255,0.12);
+  color: rgba(255,255,255,0.78);
+  background: rgba(255,255,255,0.04);
+}
+
+.chip--soft {
+  color: rgba(255,255,255,0.75);
+}
+
+.chip--ok {
+  border-color: rgba(40,215,201,0.35);
+  background: rgba(40,215,201,0.10);
+  color: rgba(40,215,201,0.95);
+}
+
+.chip--muted {
+  border-color: rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.03);
+  color: rgba(255,255,255,0.55);
+}
+
+.recentRun__right {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  padding-top: 2px;
+}
+
+.pidPill {
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(0,0,0,0.18);
+  color: rgba(255,255,255,0.70);
+  font-size: 12px;
+  white-space: nowrap;
+}

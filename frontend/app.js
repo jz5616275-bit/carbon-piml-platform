@@ -364,6 +364,116 @@ function inferFrontMode(uploadResp) {
   return { schema, featureCols, mode, scale };
 }
 
+/* Recent runs */
+async function fetchRecentPredictions(limit = 5) {
+  const n = clamp(Number(limit || 5), 1, 50);
+  return await apiFetch(`/predictions?limit=${encodeURIComponent(String(n))}`, { method: "GET" });
+}
+
+function fmtShortDate(iso) {
+  if (!iso) return "—";
+  try {
+    const s = String(iso);
+    return s.replace("T", " ").slice(0, 16);
+  } catch {
+    return String(iso);
+  }
+}
+
+function renderRecentRuns(items) {
+  const host = el("recentRunsList");
+  const status = el("recentRunsStatus");
+  if (!host) return;
+
+  host.innerHTML = "";
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) {
+    host.innerHTML = `
+      <div class="recentRuns__empty">
+        No runs yet. Run a prediction to see history here.
+      </div>
+    `;
+    if (status) status.textContent = "—";
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  list.forEach((it, idx) => {
+    const pid = it.prediction_id || "";
+    const when = fmtShortDate(it.created_at);
+    const scenario = (it.scenario_name || "").trim();
+    const title = scenario ? scenario : `Run #${idx + 1}`;
+    const a = document.createElement("a");
+    a.className = "recentRun";
+    a.href = `./results.html?pid=${encodeURIComponent(pid)}`;
+    const left = document.createElement("div");
+    left.className = "recentRun__left";
+    const t = document.createElement("div");
+    t.className = "recentRun__title";
+    t.textContent = title;
+    const meta = document.createElement("div");
+    meta.className = "recentRun__meta";
+    meta.textContent = when;
+    const chips = document.createElement("div");
+    chips.className = "recentRun__chips";
+    const mkChip = (text, kind = "soft") => {
+      const s = document.createElement("span");
+      s.className = `chip chip--${kind}`;
+      s.textContent = text;
+      return s;
+    };
+
+    chips.appendChild(mkChip(it.scale_used || "—"));
+    chips.appendChild(mkChip(it.mode_used || "—"));
+    chips.appendChild(mkChip(it.physics_mode || "—"));
+    const adj = Number(it.num_adjusted ?? 0);
+    chips.appendChild(mkChip(`adjusted ${adj}`, adj > 0 ? "ok" : "muted"));
+    left.appendChild(t);
+    left.appendChild(meta);
+    left.appendChild(chips);
+    const right = document.createElement("div");
+    right.className = "recentRun__right";
+    const pill = document.createElement("div");
+    pill.className = "pidPill";
+    pill.textContent = pid ? `${String(pid).slice(0, 8)}…` : "—";
+    right.appendChild(pill);
+    a.appendChild(left);
+    a.appendChild(right);
+    frag.appendChild(a);
+  });
+
+  host.appendChild(frag);
+  if (status) {
+    status.textContent = `Showing last ${list.length} runs.`;
+  }
+}
+
+async function refreshRecentRuns() {
+  if (!state.authed) {
+    const host = el("recentRunsList");
+    const status = el("recentRunsStatus");
+    if (host) host.innerHTML = "";
+    if (status) status.textContent = "Login to view recent runs.";
+    return;
+  }
+  const status = el("recentRunsStatus");
+  if (status) status.textContent = "Loading...";
+  try {
+    const resp = await fetchRecentPredictions(5);
+    renderRecentRuns(resp.items || []);
+  } catch (err) {
+    const host = el("recentRunsList");
+    if (host) {
+      host.innerHTML = "";
+      const li = document.createElement("li");
+      li.style.opacity = "0.85";
+      li.textContent = `Failed to load recent runs: ${(err && err.message) || String(err)}`;
+      host.appendChild(li);
+    }
+    if (status) status.textContent = "—";
+  }
+}
+
 /* Disturb UI */
 function rebuildDisturbUI() {
   const enabled = el("disturbEnabled")?.checked;
@@ -420,17 +530,14 @@ function buildFeatureSliders(cols) {
     wrap.appendChild(label);
     wrap.appendChild(slider);
     wrap.appendChild(valueBox);
-
     const inputLine = document.createElement("div");
     inputLine.className = "row";
     inputLine.style.marginTop = "6px";
-
     const inputLabel = document.createElement("div");
     inputLabel.className = "card__hint";
     inputLabel.style.margin = "0";
     inputLabel.style.width = "220px";
     inputLabel.textContent = "Or type value (%)";
-
     const input = document.createElement("input");
     input.className = "input";
     input.type = "number";
@@ -556,7 +663,9 @@ function readPhysics() {
   else if (smooth) physicsMode = "smoothness";
   else if (nonNeg) physicsMode = "non_negative";
 
-  const applyTo = String(el("applyToSelect")?.value || "test_forecast").toLowerCase();
+  // Apply-to is fixed to test_forecast (UI removed)
+  const applyTo = "test_forecast";
+
   const capRaw = el("capValue")?.value;
   const capValue = capRaw === "" ? null : Number(capRaw);
   const physics = {
@@ -1012,9 +1121,9 @@ function renderResults(doc) {
   setStatus("resultsStatus", "Loaded.", false);
 }
 
-const PLOT_EPS = 1e-6; 
-const HIDE_PIML_IN_FIT = true; 
-const SHOW_PIML_ONLY_WHEN_DIFF = true; 
+const PLOT_EPS = 1e-6;
+const HIDE_PIML_IN_FIT = true;
+const SHOW_PIML_ONLY_WHEN_DIFF = true;
 
 function _toMap(series) {
   const m = new Map();
@@ -1185,6 +1294,9 @@ function initSetupPage() {
   el("smoothStrength")?.addEventListener("change", syncPhysicsUi);
   updatePhysicsUI();
 
+  // Recent runs
+  refreshRecentRuns();
+
   el("uploadBtn")?.addEventListener("click", async () => {
     if (!state.authed) {
       setStatus("runStatus", "Please login first.", true);
@@ -1241,11 +1353,9 @@ function initSetupPage() {
     if (el("scenarioName")) el("scenarioName").value = "";
     refreshHorizonSelect({ keepValue: false });
     resetHorizonToDefault();
-
     if (el("phyNonNeg")) el("phyNonNeg").checked = true;
     if (el("phySmooth")) el("phySmooth").checked = true;
     if (el("phyCap")) el("phyCap").checked = false;
-    if (el("applyToSelect")) el("applyToSelect").value = "test_forecast";
     if (el("smoothStrength")) el("smoothStrength").value = "auto_normal";
     if (el("maxChangeRate")) el("maxChangeRate").value = "";
     if (el("capValue")) el("capValue").value = "";
@@ -1253,7 +1363,6 @@ function initSetupPage() {
     if (el("globalPct")) el("globalPct").value = "0";
     if (el("globalPctInput")) el("globalPctInput").value = "0";
     setText("globalPctVal", "0");
-
     if (el("evalEnabled")) el("evalEnabled").checked = true;
     if (el("evalMode")) el("evalMode").value = "ratio";
     if (el("evalK")) el("evalK").value = "12";
@@ -1273,6 +1382,7 @@ function initSetupPage() {
     try {
       const resp = await runPrediction();
       cacheLastResponse(resp);
+      refreshRecentRuns();
       const pid = resp.prediction_id;
       if (!pid) throw new Error("Missing prediction_id in response.");
       window.location.href = `./results.html?pid=${encodeURIComponent(pid)}`;
@@ -1310,7 +1420,6 @@ async function initResultsPage() {
   segBtns.forEach((b) => { b.addEventListener("click", () => setActiveSegment(b.dataset.seg)); });
   el("exportJsonBtn")?.addEventListener("click", exportJson);
   el("exportCsvBtn")?.addEventListener("click", exportCsv);
-
   refreshBtn?.addEventListener("click", async () => {
     const pid = getPidFromUrl();
     if (!pid) return;

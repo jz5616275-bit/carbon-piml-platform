@@ -4,11 +4,11 @@ import time
 from typing import Any, Dict, Optional
 import requests
 from flask import Request
-from jose import jwt
-from jose.exceptions import JWTError
+from jose import jwt # type: ignore
+from jose.exceptions import JWTError # type: ignore
 
 _JWKS_CACHE: Dict[str, Any] = {"jwks": None, "fetched_at": 0.0}
-_JWKS_TTL_SECONDS = 60 * 60  # 1 hour
+_JWKS_TTL_SECONDS = 60 * 60 
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -98,6 +98,5 @@ def get_user_from_request(req: Request) -> Dict[str, str]:
 
         return {"user_id": user_id, "user_name": user_name, "user_role": "user"}
 
-    except (requests.RequestException, JWTError, ValueError) as e:
+    except (requests.RequestException, jose.exceptions.JWTError, ValueError) as e: # type: ignore
         raise ValueError(f"Unauthorized: {str(e)}")
-

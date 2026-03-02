@@ -14,7 +14,6 @@ from backend.utils.data_validator import validate_disturbance, validate_evaluati
 
 predictions_blueprint = Blueprint("predictions_blueprint", __name__)
 
-
 def _detect_mode_from_upload(upload: Dict[str, Any]) -> str:
     feature_cols = (upload.get("schema", {}) or {}).get("feature_cols", []) or []
     return "advanced" if len(feature_cols) > 0 else "basic"
@@ -435,7 +434,16 @@ def _annotate_fit_test_kinds(baseline: List[Dict[str, Any]], *, n_history: int, 
     return out
 
 
-def _parse_predict_payload() -> Tuple[str, int, Optional[str], str, Dict[str, Any], Dict[str, Any] | None, Dict[str, Any] | None]:
+def _parse_predict_payload() -> Tuple[
+    str,
+    int,
+    Optional[str],
+    str,
+    Dict[str, Any],
+    Dict[str, Any] | None,
+    Dict[str, Any] | None,
+    str,
+]:
     payload = request.get_json(silent=True) or {}
     upload_id = payload.get("upload_id")
     if not upload_id:
@@ -488,7 +496,9 @@ def _parse_predict_payload() -> Tuple[str, int, Optional[str], str, Dict[str, An
 
     disturbance = payload.get("disturbance")
     evaluation = payload.get("evaluation")
-    return upload_id, horizon, mode_override, physics_mode, physics_user, disturbance, evaluation
+    scenario_name = str(payload.get("scenario_name") or "").strip()
+
+    return upload_id, horizon, mode_override, physics_mode, physics_user, disturbance, evaluation, scenario_name
 
 
 def _derive_physics_effective(
@@ -601,6 +611,66 @@ def _run_physics(
     return piml, correction_summary, comparison, delta_series, why_no
 
 
+@predictions_blueprint.route("/predictions", methods=["GET"])
+def list_predictions():
+    try:
+        user = get_user_from_request(request)
+    except ValueError as e:
+        return make_response(jsonify({"error": str(e)}), 401)
+
+    try:
+        raw_limit = request.args.get("limit", "5")
+        try:
+            limit = int(raw_limit)
+        except Exception:
+            limit = 5
+        limit = max(1, min(50, limit))
+
+        cursor = (
+            db.predictions.find({"owner.user_id": user["user_id"]})
+            .sort("created_at", -1)
+            .limit(limit)
+        )
+
+        items: List[Dict[str, Any]] = []
+        for doc in cursor:
+            params = doc.get("params") or {}
+            scenario_name = str(params.get("scenario_name") or "").strip()
+            physics_eff = params.get("physics_effective") or {}
+            phys_mode = (
+                str(physics_eff.get("physics_mode") or params.get("physics_mode") or "")
+                .strip()
+                .lower()
+            )
+
+            outputs = doc.get("outputs") or {}
+            orig = outputs.get("original") or {}
+            cs = orig.get("correction_summary") or {}
+            num_adj = cs.get("num_adjusted")
+            try:
+                num_adj_i = int(num_adj) if num_adj is not None else 0
+            except Exception:
+                num_adj_i = 0
+
+            items.append(
+                {
+                    "prediction_id": str(doc["_id"]),
+                    "created_at": doc.get("created_at").isoformat() if doc.get("created_at") else None,
+                    "scenario_name": scenario_name,
+                    "scale_used": doc.get("scale_used"),
+                    "mode_used": doc.get("mode_used"),
+                    "method": doc.get("method"),
+                    "physics_mode": phys_mode or None,
+                    "num_adjusted": num_adj_i,
+                }
+            )
+
+        return make_response(jsonify({"items": items, "limit": limit}), 200)
+
+    except Exception as e:
+        return make_response(jsonify({"error": "Failed to list predictions.", "details": str(e)}), 500)
+
+
 @predictions_blueprint.route("/predict", methods=["POST"])
 def create_prediction():
     try:
@@ -609,7 +679,7 @@ def create_prediction():
         return make_response(jsonify({"error": str(e)}), 401)
 
     try:
-        upload_id, horizon_raw, mode_override, physics_mode, physics_user, disturbance_raw, evaluation_raw = _parse_predict_payload()
+        upload_id, horizon_raw, mode_override, physics_mode, physics_user, disturbance_raw, evaluation_raw, scenario_name = _parse_predict_payload()
     except ValueError as e:
         return make_response(jsonify({"error": str(e)}), 400)
 
@@ -889,6 +959,7 @@ def create_prediction():
         "mode_used": mode_used,
         "method": method,
         "params": {
+            "scenario_name": scenario_name,
             "horizon_months": horizon_raw,
             "horizon_unit": horizon_unit,
             "mode_override": mode_override,
@@ -910,7 +981,6 @@ def create_prediction():
     }
 
     try:
-        db.predictions.delete_many({"upload_id": ObjectId(upload_id), "owner.user_id": user["user_id"]})
         ins = db.predictions.insert_one(record)
     except Exception as e:
         return make_response(jsonify({"error": "Failed to save prediction record.", "details": str(e)}), 500)
