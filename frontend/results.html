@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="./styles.css" />
     <script src="./config.js"></script>
 
-    <!-- Auth0 SPA SDK  -->
+    <!-- Auth0  -->
     <script src="https://cdn.auth0.com/js/auth0-spa-js/2.0/auth0-spa-js.production.js"></script>
   </head>
 
@@ -51,7 +51,6 @@
             </select>
 
             <button id="refreshBtn" class="btn btn--ghost" type="button">Refresh</button>
-            <!-- Export buttons moved to Raw JSON section (below) -->
           </div>
 
           <div id="viewHintBox" class="hintBox hidden" style="margin-top:10px;"></div>
@@ -82,14 +81,12 @@
             <div class="kpi">
               <div class="kpi__label">Adjusted points</div>
               <div class="kpi__value" id="kpiAdjPts">—</div>
-              <!-- NEW: segment-linked -->
               <div class="kpi__sub" id="kpiAdjPtsSeg">—</div>
             </div>
 
             <div class="kpi">
               <div class="kpi__label">Mean abs adjustment</div>
               <div class="kpi__value" id="kpiAdjMean">—</div>
-              <!-- NEW: segment-linked -->
               <div class="kpi__sub" id="kpiAdjMeanSeg">—</div>
             </div>
 
@@ -149,7 +146,7 @@
         </div>
       </section>
 
-      <!-- Raw JSON (collapsible) + export buttons placed here -->
+      <!-- Raw JSON -->
       <section class="card" style="margin-top:16px;">
         <div class="row" style="justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
           <div class="card__title" style="margin:0;">Raw JSON</div>
@@ -170,7 +167,6 @@
 
     <script src="./app.js"></script>
 
-    <!-- Minimal inline styles for new KPI sub-lines; keep it tiny and non-invasive -->
     <style>
       .divider { height:1px; background: rgba(255,255,255,0.10); margin: 12px 0; }
       .hintBox { padding:10px 12px; border:1px solid rgba(255,255,255,0.12); border-radius:10px; color: rgba(255,255,255,0.85); }

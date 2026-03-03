@@ -1078,6 +1078,53 @@ function setActiveSegment(seg) {
   drawActiveView();
 }
 
+/* Test KPI */
+function _toValueMap(series) {
+  const m = new Map();
+  (series || []).forEach((p) => {
+    if (!p || !p.date) return;
+    const v = Number(p.value);
+    if (!Number.isFinite(v)) return;
+    m.set(p.date, v);
+  });
+  return m;
+}
+
+function _computeKpiTest(observed, predSeries, segSets) {
+  const obsTest = filterSeriesBySegment(observed || [], "test", segSets);
+  const predTest = filterSeriesBySegment(predSeries || [], "test", segSets);
+
+  const om = _toValueMap(obsTest);
+  const pm = _toValueMap(predTest);
+
+  let n = 0;
+  let sumAbs = 0.0;
+  let sumSq = 0.0;
+  let sumApe = 0.0;
+
+  for (const [d, y] of om.entries()) {
+    if (!pm.has(d)) continue;
+    const yhat = pm.get(d);
+    if (!Number.isFinite(y) || !Number.isFinite(yhat)) continue;
+
+    const e = yhat - y;
+    n += 1;
+    sumAbs += Math.abs(e);
+    sumSq += e * e;
+
+    const denom = Math.max(Math.abs(y), 1e-9);
+    sumApe += Math.abs(e) / denom;
+  }
+
+  if (n <= 0) return null;
+
+  const rmse = Math.sqrt(sumSq / n);
+  const mae = sumAbs / n;
+  const mape = (sumApe / n) * 100.0;
+
+  return { n, rmse, mae, mape };
+}
+
 function renderResults(doc) {
   state.lastResponse = doc;
 
@@ -1093,19 +1140,10 @@ function renderResults(doc) {
   setText("applyToBox", applyTo);
   setText("rawBox", jsonPretty(doc));
 
-  const hasEval = !!doc.evaluation && !!doc.evaluation.metrics;
-  if (hasEval) {
-    const b = doc.evaluation.metrics.baseline?.accuracy || {};
-    const p = doc.evaluation.metrics.piml?.accuracy || {};
-    setText("kpiBaseErr", `RMSE ${fmtNum(b.rmse)} | MAE ${fmtNum(b.mae)} | MAPE ${fmtNum(b.mape)}`);
-    setText("kpiPimlErr", `RMSE ${fmtNum(p.rmse)} | MAE ${fmtNum(p.mae)} | MAPE ${fmtNum(p.mape)}`);
-    const improve = b.rmse && p.rmse ? ((b.rmse - p.rmse) / Math.max(b.rmse, 1e-9)) * 100 : null;
-    setText("kpiImprove", improve === null ? "—" : `${fmtNum(improve, 1)}%`);
-  } else {
-    setText("kpiBaseErr", "—");
-    setText("kpiPimlErr", "—");
-    setText("kpiImprove", "—");
-  }
+  // KPI is updated in drawActiveView() so it can change with view (original/disturbed).
+  setText("kpiBaseErr", "—");
+  setText("kpiPimlErr", "—");
+  setText("kpiImprove", "—");
 
   const viewSel = el("viewSelect");
   const disturbedExists = !!doc.outputs?.disturbed;
@@ -1204,8 +1242,31 @@ function drawActiveView() {
   const baseSeg = filterSeriesBySegment(block.baseline || [], state.activeSegment, segSets);
   const pimlSegRaw = filterSeriesBySegment(block.piml || [], state.activeSegment, segSets);
   const violSeg = filterSeriesBySegment(block.violations_series || [], state.activeSegment, segSets);
+  const kpi = block.kpi_test || {};
+  const kb = kpi.baseline || {};
+  const kp = kpi.piml || {};
 
-  // Physics KPI
+  const hasBase = (kb.rmse !== null && kb.rmse !== undefined);
+  const hasPiml = (kp.rmse !== null && kp.rmse !== undefined);
+
+  if (hasBase) {
+    setText("kpiBaseErr", `RMSE ${fmtNum(kb.rmse)} | MAE ${fmtNum(kb.mae)} | MAPE ${fmtNum(kb.mape, 2)}%`);
+  } else {
+    setText("kpiBaseErr", "—");
+  }
+
+  if (hasPiml) {
+    setText("kpiPimlErr", `RMSE ${fmtNum(kp.rmse)} | MAE ${fmtNum(kp.mae)} | MAPE ${fmtNum(kp.mape, 2)}%`);
+  } else {
+    setText("kpiPimlErr", "—");
+  }
+
+  if (hasBase && hasPiml) {
+    const improve = ((Number(kb.rmse) - Number(kp.rmse)) / Math.max(Number(kb.rmse), 1e-9)) * 100;
+    setText("kpiImprove", `${fmtNum(improve, 1)}%`);
+  } else {
+    setText("kpiImprove", "—");
+  }
   const byRule = {};
   for (const p of violSeg) {
     const rules = p.rules_hit || [];
@@ -1213,7 +1274,6 @@ function drawActiveView() {
   }
   const parts = ["non_negative", "cap", "rate_limit", "spike_clip"].map((r) => `${r} ${byRule[r] || 0}`);
   setText("kpiPhys", `B vs P shown by rule hits: ${parts.join(", ")}`);
-
   const cs = block.correction_summary || {};
   const numAdj = (cs.num_adjusted ?? cs.n_adjusted_points);
   const ratio = (cs.adjusted_ratio ?? cs.adjustedRatio);
@@ -1225,7 +1285,6 @@ function drawActiveView() {
   const segRatioText = `${fmtNum(segStats.adjusted_ratio * 100, 1)}%`;
   setText("kpiAdjPtsSeg", `In current view (segment): ${segStats.n_adjusted} (${segRatioText})`);
   setText("kpiAdjMeanSeg", `In current view (segment): ${fmtNum(segStats.mean_abs_adjustment)}`);
-
   const legendObsDist = el("legendObsDisturbed");
   if (legendObsDist) {
     if (view === "disturbed" && obsDSeg && obsDSeg.length) show(legendObsDist);
@@ -1236,17 +1295,16 @@ function drawActiveView() {
     const series = [
       { key: "obs", data: obsSeg.map((p) => ({ ...p, value: p.value })), stroke: "rgba(255,255,255,0.9)" },
     ];
-
     if (view === "disturbed" && obsDSeg && obsDSeg.length) {
       series.push({ key: "obsD", data: obsDSeg.map((p) => ({ ...p, value: p.value })), stroke: "rgba(255,195,80,0.95)" });
     }
-
     series.push({ key: "base", data: baseSeg.map((p) => ({ ...p, value: p.value })), stroke: "rgba(58,123,253,0.95)" });
     const seg = String(state.activeSegment || "test_forecast").toLowerCase();
     const hideInFit = HIDE_PIML_IN_FIT && seg === "fit";
     const physMode = _getPhysMode(state.lastResponse);
     const backendSaysNoAdj = (numAdj !== null && numAdj !== undefined) ? (Number(numAdj) <= 0) : false;
     const backendModeNone = physMode === "none";
+
     let pimlToPlot = pimlSegRaw.map((p) => ({ ...p, value: p.value }));
     if (SHOW_PIML_ONLY_WHEN_DIFF) {
       pimlToPlot = _maskedPimlSeries(pimlToPlot, baseSeg, PLOT_EPS);

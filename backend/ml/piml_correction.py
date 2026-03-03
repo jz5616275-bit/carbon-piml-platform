@@ -28,7 +28,6 @@ def apply_physics_corrections(
     apply_to: str = "test_forecast",
     prev_value: Optional[float] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-
     mode = (physics_mode or "none").strip().lower()
     a2 = (apply_to or "test_forecast").strip().lower()
 
@@ -52,7 +51,6 @@ def apply_physics_corrections(
     by_rule = {}
     violations_series = []
     prev = float(prev_value) if prev_value is not None else None
-
     for p in series:
         d = p["date"]
         kind = p.get("kind", "")
@@ -97,7 +95,6 @@ def apply_physics_corrections(
     changed = len({a["date"] for a in adjustments})
     denom = max(1, len([p for p in series if _is_target_kind(p.get("kind", ""), a2)]))
     ratio = changed / denom if denom else 0.0
-
     summary = {
         "num_adjusted": len(adjustments),
         "max_abs_adjustment": float(max_abs),
@@ -109,5 +106,3 @@ def apply_physics_corrections(
     }
 
     return corrected, summary
-
-

@@ -7,7 +7,11 @@ from dateutil.relativedelta import relativedelta
 from flask import Blueprint, jsonify, make_response, request
 from backend.api.auth_utils import get_user_from_request
 from backend.globals import db
-from backend.ml.disturbance import apply_basic_disturbance, build_advanced_future_features
+from backend.ml.disturbance import (
+    apply_basic_disturbance_to_series,
+    build_advanced_future_features,
+    build_basic_observed_whatif_for_dates,
+)
 from backend.ml.evaluation import evaluate_history, physical_metrics
 from backend.ml.piml_correction import apply_physics_corrections
 from backend.utils.data_validator import validate_disturbance, validate_evaluation, validate_horizon
@@ -69,72 +73,137 @@ def _time_basis(t: np.ndarray, periods: List[float], *, trend_degree: int = 1) -
     return np.vstack(feats).T
 
 
-def _basic_predict_monthly(points: List[Dict[str, Any]], horizon_months: int) -> List[Dict[str, Any]]:
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def _compute_test_kpi(
+    observed: List[Dict[str, Any]],
+    pred_series: List[Dict[str, Any]],
+    *,
+    n_history: int,
+    n_test: int,
+) -> Dict[str, Any]:
+    if not observed or n_history <= 0 or n_test <= 0:
+        return {"rmse": None, "mae": None, "mape": None, "n": 0}
+
+    dates = [p.get("date") for p in observed if p.get("date")]
+    if len(dates) < n_history:
+        n_history = len(dates)
+
+    split_idx = max(0, n_history - n_test)
+    test_dates = set(dates[split_idx:n_history])
+    obs_map = {p["date"]: _safe_float(p.get("value")) for p in observed if p.get("date") in test_dates}
+    pred_map = {p["date"]: _safe_float(p.get("value")) for p in pred_series if p.get("date") in test_dates and (p.get("kind") or "").lower() == "test_pred"}
+    ys = []
+    yh = []
+    for d, y in obs_map.items():
+        if d in pred_map:
+            ys.append(float(y))
+            yh.append(float(pred_map[d]))
+
+    if not ys:
+        return {"rmse": None, "mae": None, "mape": None, "n": 0}
+
+    y_np = np.asarray(ys, dtype=float)
+    yh_np = np.asarray(yh, dtype=float)
+    err = yh_np - y_np
+    rmse = float(np.sqrt(np.mean(err * err)))
+    mae = float(np.mean(np.abs(err)))
+    denom = np.maximum(np.abs(y_np), 1e-9)
+    mape = float(np.mean(np.abs(err) / denom)) * 100.0
+
+    return {"rmse": rmse, "mae": mae, "mape": mape, "n": int(len(ys))}
+
+
+def _basic_fit_predict_monthly(points: List[Dict[str, Any]], n_train: int, n_test: int, horizon_months: int) -> List[Dict[str, Any]]:
     n = len(points)
-    t = np.arange(n, dtype=float)
-    y = np.array([float(p["y"]) for p in points], dtype=float)
-    X = _time_basis(t, periods=[12.0], trend_degree=1)
-    w = _ridge_solve(X, y, alpha=1.0)
-    fitted = (X @ w).tolist()
+    t_all = np.arange(n, dtype=float)
+    y_all = np.array([float(p["y"]) for p in points], dtype=float)
+    n_train = int(max(2, min(n_train, n)))
+    X_train = _time_basis(t_all[:n_train], periods=[12.0], trend_degree=1)
+    w = _ridge_solve(X_train, y_all[:n_train], alpha=1.0)
+    X_fit = _time_basis(t_all[:n_train], periods=[12.0], trend_degree=1)
+    fit_pred = (X_fit @ w).tolist()
+    X_test = _time_basis(t_all[n_train:n], periods=[12.0], trend_degree=1) if n_train < n else np.zeros((0, X_train.shape[1]))
+    test_pred = (X_test @ w).tolist() if len(X_test) else []
     ft = np.arange(n, n + horizon_months, dtype=float)
     Xf = _time_basis(ft, periods=[12.0], trend_degree=1)
-    future_y = (Xf @ w).tolist()
+    forecast = (Xf @ w).tolist()
     last_date = points[-1]["date"]
     future_dates = [_month_add(last_date, i) for i in range(1, horizon_months + 1)]
     out: List[Dict[str, Any]] = []
-    for i in range(n):
-        out.append({"date": points[i]["date"], "value": float(fitted[i]), "kind": "fitted"})
+    for i in range(n_train):
+        out.append({"date": points[i]["date"], "value": float(fit_pred[i]), "kind": "fit_pred"})
+    for i in range(n_train, n):
+        out.append({"date": points[i]["date"], "value": float(test_pred[i - n_train]), "kind": "test_pred"})
     for i in range(horizon_months):
-        out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
+        out.append({"date": future_dates[i], "value": float(forecast[i]), "kind": "forecast"})
     return out
 
 
-def _basic_predict_yearly(points: List[Dict[str, Any]], horizon_years: int) -> List[Dict[str, Any]]:
+def _basic_fit_predict_yearly(points: List[Dict[str, Any]], n_train: int, n_test: int, horizon_years: int) -> List[Dict[str, Any]]:
     n = len(points)
-    t = np.arange(n, dtype=float)
-    y = np.array([float(p["y"]) for p in points], dtype=float)
-    X = _time_basis(t, periods=[], trend_degree=1)
-    w = _ridge_solve(X, y, alpha=1.0)
-    fitted = (X @ w).tolist()
+    t_all = np.arange(n, dtype=float)
+    y_all = np.array([float(p["y"]) for p in points], dtype=float)
+    n_train = int(max(2, min(n_train, n)))
+    X_train = _time_basis(t_all[:n_train], periods=[], trend_degree=1)
+    w = _ridge_solve(X_train, y_all[:n_train], alpha=1.0)
+    X_fit = _time_basis(t_all[:n_train], periods=[], trend_degree=1)
+    fit_pred = (X_fit @ w).tolist()
+    X_test = _time_basis(t_all[n_train:n], periods=[], trend_degree=1) if n_train < n else np.zeros((0, X_train.shape[1]))
+    test_pred = (X_test @ w).tolist() if len(X_test) else []
     ft = np.arange(n, n + horizon_years, dtype=float)
     Xf = _time_basis(ft, periods=[], trend_degree=1)
-    future_y = (Xf @ w).tolist()
+    forecast = (Xf @ w).tolist()
     last_date = points[-1]["date"]
     future_dates = [_year_add(last_date, i) for i in range(1, horizon_years + 1)]
     out: List[Dict[str, Any]] = []
-    for i in range(n):
-        out.append({"date": points[i]["date"], "value": float(fitted[i]), "kind": "fitted"})
+    for i in range(n_train):
+        out.append({"date": points[i]["date"], "value": float(fit_pred[i]), "kind": "fit_pred"})
+    for i in range(n_train, n):
+        out.append({"date": points[i]["date"], "value": float(test_pred[i - n_train]), "kind": "test_pred"})
     for i in range(horizon_years):
-        out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
+        out.append({"date": future_dates[i], "value": float(forecast[i]), "kind": "forecast"})
     return out
 
 
-def _basic_predict_daily(points: List[Dict[str, Any]], horizon_days: int) -> List[Dict[str, Any]]:
+def _basic_fit_predict_daily(points: List[Dict[str, Any]], n_train: int, n_test: int, horizon_days: int) -> List[Dict[str, Any]]:
     n = len(points)
-    y = np.array([float(p["y"]) for p in points], dtype=float)
+    y_all = np.array([float(p["y"]) for p in points], dtype=float)
+    n_train = int(max(10, min(n_train, n)))
     lags = [1, 7, 14]
     max_lag = max(lags)
-    if n <= max_lag + 5:
-        t = np.arange(n, dtype=float)
-        X = _time_basis(t, periods=[7.0, 30.0, 365.25], trend_degree=1)
-        w = _ridge_solve(X, y, alpha=50.0)
-        fitted = (X @ w).tolist()
+
+    if n_train <= max_lag + 5:
+        t_all = np.arange(n, dtype=float)
+        X_train = _time_basis(t_all[:n_train], periods=[7.0, 30.0, 365.25], trend_degree=1)
+        w = _ridge_solve(X_train, y_all[:n_train], alpha=50.0)
+        fit_pred = (X_train @ w).tolist()
+        X_test = _time_basis(t_all[n_train:n], periods=[7.0, 30.0, 365.25], trend_degree=1) if n_train < n else np.zeros((0, X_train.shape[1]))
+        test_pred = (X_test @ w).tolist() if len(X_test) else []
         ft = np.arange(n, n + horizon_days, dtype=float)
         Xf = _time_basis(ft, periods=[7.0, 30.0, 365.25], trend_degree=1)
-        future_y = (Xf @ w).tolist()
+        forecast = (Xf @ w).tolist()
         last_date = points[-1]["date"]
         future_dates = [_day_add(last_date, i) for i in range(1, horizon_days + 1)]
         out: List[Dict[str, Any]] = []
-        for i in range(n):
-            out.append({"date": points[i]["date"], "value": float(fitted[i]), "kind": "fitted"})
+        for i in range(n_train):
+            out.append({"date": points[i]["date"], "value": float(fit_pred[i]), "kind": "fit_pred"})
+        for i in range(n_train, n):
+            out.append({"date": points[i]["date"], "value": float(test_pred[i - n_train]), "kind": "test_pred"})
         for i in range(horizon_days):
-            out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
+            out.append({"date": future_dates[i], "value": float(forecast[i]), "kind": "forecast"})
         return out
 
-    idx = np.arange(max_lag, n, dtype=int)
+    # Build training design
+    idx = np.arange(max_lag, n_train, dtype=int)
     t = idx.astype(float)
     t0 = float(max_lag)
-    t_scale = float(max(1, (n - 1) - max_lag))
+    t_scale = float(max(1, (n_train - 1) - max_lag))
     t_norm = (t - t0) / t_scale
     t_season = (idx - max_lag).astype(float)
     X_time = _time_basis(t_season, periods=[7.0, 30.0, 365.25], trend_degree=0)
@@ -150,25 +219,28 @@ def _basic_predict_daily(points: List[Dict[str, Any]], horizon_days: int) -> Lis
     y_train: List[float] = []
     for i in idx:
         row = [
-            float(y[i - 1]),
-            float(y[i - 7]),
-            float(y[i - 14]),
-            _roll_mean(y, i, 7),
+            float(y_all[i - 1]),
+            float(y_all[i - 7]),
+            float(y_all[i - 14]),
+            _roll_mean(y_all, i, 7),
         ]
         X_ar.append(row)
-        y_train.append(float(y[i]))
+        y_train.append(float(y_all[i]))
 
     X_ar_np = np.asarray(X_ar, dtype=float)
     y_np = np.asarray(y_train, dtype=float)
     X = np.hstack([X_trend, X_time, X_ar_np])
     w = _ridge_solve(X, y_np, alpha=5.0)
-    fitted_all = np.zeros(n, dtype=float)
-    fitted_all[:max_lag] = y[:max_lag]
-    fitted_all[max_lag:] = (X @ w)
-    future_vals: List[float] = []
-    buf = list(y.tolist())
-    for k in range(1, horizon_days + 1):
-        i = n - 1 + k
+
+    # Fit preds on TRAIN
+    fit_vals = [float(y_all[i]) for i in range(n_train)]
+    for k, i in enumerate(idx):
+        fit_vals[i] = float((X[k, :] @ w))
+    total_forward = int((n - n_train) + horizon_days)
+    buf = list(y_all[:n_train].tolist())
+    forward_vals: List[float] = []
+    for step in range(1, total_forward + 1):
+        i = (n_train - 1) + step
         t_seas = float(i - max_lag)
         t_norm_f = (float(i) - t0) / t_scale
         X_time_f = _time_basis(np.array([t_seas]), periods=[7.0, 30.0, 365.25], trend_degree=0)
@@ -180,16 +252,21 @@ def _basic_predict_daily(points: List[Dict[str, Any]], horizon_days: int) -> Lis
         X_ar_f = np.array([[lag1, lag7, lag14, rm7]], dtype=float)
         Xf = np.hstack([X_trend_f, X_time_f, X_ar_f])
         y_next = float((Xf @ w).reshape(-1)[0])
-        future_vals.append(y_next)
+        forward_vals.append(y_next)
         buf.append(y_next)
 
+    test_len = int(n - n_train)
+    test_pred = forward_vals[:test_len]
+    forecast = forward_vals[test_len:]
     last_date = points[-1]["date"]
     future_dates = [_day_add(last_date, i) for i in range(1, horizon_days + 1)]
     out: List[Dict[str, Any]] = []
-    for i in range(n):
-        out.append({"date": points[i]["date"], "value": float(fitted_all[i]), "kind": "fitted"})
+    for i in range(n_train):
+        out.append({"date": points[i]["date"], "value": float(fit_vals[i]), "kind": "fit_pred"})
+    for i in range(n_train, n):
+        out.append({"date": points[i]["date"], "value": float(test_pred[i - n_train]), "kind": "test_pred"})
     for i in range(horizon_days):
-        out.append({"date": future_dates[i], "value": float(future_vals[i]), "kind": "forecast"})
+        out.append({"date": future_dates[i], "value": float(forecast[i]), "kind": "forecast"})
     return out
 
 
@@ -198,12 +275,12 @@ def _advanced_fit(
     feature_cols: List[str],
     *,
     scale_used: str,
+    n_train: int,
 ) -> Tuple[np.ndarray, List[str], np.ndarray, np.ndarray]:
     X_rows: List[List[float]] = []
     y_vals: List[float] = []
     dates: List[str] = []
     t_vals: List[float] = []
-
     for i, p in enumerate(points):
         feats = p.get("features", {}) or {}
         row: List[float] = []
@@ -229,172 +306,84 @@ def _advanced_fit(
     if len(X_rows) < 6:
         raise ValueError("Not enough valid feature rows for advanced prediction (need >= 6).")
 
-    X_feat = np.array(X_rows, dtype=float)
-    y = np.array(y_vals, dtype=float)
-    t = np.array(t_vals, dtype=float)
-
+    X_feat_all = np.array(X_rows, dtype=float)
+    y_all = np.array(y_vals, dtype=float)
+    t_all = np.array(t_vals, dtype=float)
+    n_train = int(max(2, min(n_train, len(y_all))))
     scale = (scale_used or "monthly").strip().lower()
     if scale == "daily":
-        X_time = _time_basis(t, periods=[7.0, 30.0, 365.25], trend_degree=1)
+        X_time_all = _time_basis(t_all, periods=[7.0, 30.0, 365.25], trend_degree=1)
         alpha = 50.0
     elif scale == "yearly":
-        X_time = _time_basis(t, periods=[], trend_degree=1)
+        X_time_all = _time_basis(t_all, periods=[], trend_degree=1)
         alpha = 1.0
     else:
-        X_time = _time_basis(t, periods=[12.0], trend_degree=1)
+        X_time_all = _time_basis(t_all, periods=[12.0], trend_degree=1)
         alpha = 1.0
 
-    X = np.hstack([X_time, X_feat])
-    w = _ridge_solve(X, y, alpha=alpha)
-    return w, dates, X_feat, t
+    X_all = np.hstack([X_time_all, X_feat_all])
+    w = _ridge_solve(X_all[:n_train, :], y_all[:n_train], alpha=alpha)
+    return w, dates, X_feat_all, t_all
 
 
-def _advanced_predict_monthly(points: List[Dict[str, Any]], feature_cols: List[str], horizon_months: int) -> List[Dict[str, Any]]:
-    w, dates, X_feat, t = _advanced_fit(points, feature_cols, scale_used="monthly")
-    X_time = _time_basis(t, periods=[12.0], trend_degree=1)
-    X = np.hstack([X_time, X_feat])
-    y_hat = (X @ w).tolist()
-    last_feats = X_feat[-1, :].copy()
-    ft = np.arange(len(t), len(t) + horizon_months, dtype=float)
-    Xf_time = _time_basis(ft, periods=[12.0], trend_degree=1)
-    Xf_feat = np.tile(last_feats, (horizon_months, 1))
-    Xf = np.hstack([Xf_time, Xf_feat])
-    future_y = (Xf @ w).tolist()
-    last_date = dates[-1]
-    future_dates = [_month_add(last_date, i) for i in range(1, horizon_months + 1)]
-    out: List[Dict[str, Any]] = []
-    for i, d in enumerate(dates):
-        out.append({"date": d, "value": float(y_hat[i]), "kind": "fitted"})
-    for i in range(horizon_months):
-        out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
-    return out
-
-
-def _advanced_predict_yearly(points: List[Dict[str, Any]], feature_cols: List[str], horizon_years: int) -> List[Dict[str, Any]]:
-    w, dates, X_feat, t = _advanced_fit(points, feature_cols, scale_used="yearly")
-    X_time = _time_basis(t, periods=[], trend_degree=1)
-    X = np.hstack([X_time, X_feat])
-    y_hat = (X @ w).tolist()
-    last_feats = X_feat[-1, :].copy()
-    ft = np.arange(len(t), len(t) + horizon_years, dtype=float)
-    Xf_time = _time_basis(ft, periods=[], trend_degree=1)
-    Xf_feat = np.tile(last_feats, (horizon_years, 1))
-    Xf = np.hstack([Xf_time, Xf_feat])
-    future_y = (Xf @ w).tolist()
-    last_date = dates[-1]
-    future_dates = [_year_add(last_date, i) for i in range(1, horizon_years + 1)]
-    out: List[Dict[str, Any]] = []
-    for i, d in enumerate(dates):
-        out.append({"date": d, "value": float(y_hat[i]), "kind": "fitted"})
-    for i in range(horizon_years):
-        out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
-    return out
-
-
-def _advanced_predict_daily(points: List[Dict[str, Any]], feature_cols: List[str], horizon_days: int) -> List[Dict[str, Any]]:
-    w, dates, X_feat, t = _advanced_fit(points, feature_cols, scale_used="daily")
-    X_time = _time_basis(t, periods=[7.0, 30.0, 365.25], trend_degree=1)
-    X = np.hstack([X_time, X_feat])
-    y_hat = (X @ w).tolist()
-    last_feats = X_feat[-1, :].copy()
-    ft = np.arange(len(t), len(t) + horizon_days, dtype=float)
-    Xf_time = _time_basis(ft, periods=[7.0, 30.0, 365.25], trend_degree=1)
-    Xf_feat = np.tile(last_feats, (horizon_days, 1))
-    Xf = np.hstack([Xf_time, Xf_feat])
-    future_y = (Xf @ w).tolist()
-    last_date = dates[-1]
-    future_dates = [_day_add(last_date, i) for i in range(1, horizon_days + 1)]
-    out: List[Dict[str, Any]] = []
-    for i, d in enumerate(dates):
-        out.append({"date": d, "value": float(y_hat[i]), "kind": "fitted"})
-    for i in range(horizon_days):
-        out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
-    return out
-
-
-def _advanced_predict_monthly_with_future_features(
+def _advanced_fit_predict(
     points: List[Dict[str, Any]],
     feature_cols: List[str],
-    horizon_months: int,
-    future_features: Dict[str, float],
+    *,
+    scale_used: str,
+    n_train: int,
+    horizon_steps: int,
+    future_features: Optional[Dict[str, float]] = None,
+    test_feature_pct: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    w, dates, X_feat, t = _advanced_fit(points, feature_cols, scale_used="monthly")
-    X_time = _time_basis(t, periods=[12.0], trend_degree=1)
-    X = np.hstack([X_time, X_feat])
-    y_hat = (X @ w).tolist()
-    last_feats = X_feat[-1, :].copy()
-    for i, col in enumerate(feature_cols):
-        if col in future_features:
-            last_feats[i] = float(future_features[col])
-    ft = np.arange(len(t), len(t) + horizon_months, dtype=float)
-    Xf_time = _time_basis(ft, periods=[12.0], trend_degree=1)
-    Xf_feat = np.tile(last_feats, (horizon_months, 1))
+    w, dates, X_feat_all, t_all = _advanced_fit(points, feature_cols, scale_used=scale_used, n_train=n_train)
+    n = len(dates)
+    scale = (scale_used or "monthly").strip().lower()
+    if scale == "daily":
+        X_time_all = _time_basis(t_all, periods=[7.0, 30.0, 365.25], trend_degree=1)
+        Xf_time = _time_basis(np.arange(n, n + horizon_steps, dtype=float), periods=[7.0, 30.0, 365.25], trend_degree=1)
+    elif scale == "yearly":
+        X_time_all = _time_basis(t_all, periods=[], trend_degree=1)
+        Xf_time = _time_basis(np.arange(n, n + horizon_steps, dtype=float), periods=[], trend_degree=1)
+    else:
+        X_time_all = _time_basis(t_all, periods=[12.0], trend_degree=1)
+        Xf_time = _time_basis(np.arange(n, n + horizon_steps, dtype=float), periods=[12.0], trend_degree=1)
+
+    # apply test feature disturbance
+    X_feat_used = X_feat_all.copy()
+    if test_feature_pct:
+        pct_map = {str(k): float(v) for k, v in (test_feature_pct or {}).items()}
+        for j, col in enumerate(feature_cols):
+            pct = float(pct_map.get(col, 0.0))
+            if abs(pct) <= 1e-12:
+                continue
+            X_feat_used[n_train:, j] = X_feat_used[n_train:, j] * (1.0 + pct)
+
+    X_all = np.hstack([X_time_all, X_feat_used])
+    y_hat_all = (X_all @ w).tolist()
+    last_feats = X_feat_all[-1, :].copy()
+    if future_features:
+        for j, col in enumerate(feature_cols):
+            if col in future_features:
+                last_feats[j] = float(future_features[col])
+
+    Xf_feat = np.tile(last_feats, (horizon_steps, 1))
     Xf = np.hstack([Xf_time, Xf_feat])
     future_y = (Xf @ w).tolist()
     last_date = dates[-1]
-    future_dates = [_month_add(last_date, i) for i in range(1, horizon_months + 1)]
+    if scale == "daily":
+        future_dates = [_day_add(last_date, i) for i in range(1, horizon_steps + 1)]
+    elif scale == "yearly":
+        future_dates = [_year_add(last_date, i) for i in range(1, horizon_steps + 1)]
+    else:
+        future_dates = [_month_add(last_date, i) for i in range(1, horizon_steps + 1)]
+
     out: List[Dict[str, Any]] = []
-    for i, d in enumerate(dates):
-        out.append({"date": d, "value": float(y_hat[i]), "kind": "fitted"})
-    for i in range(horizon_months):
-        out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
-    return out
-
-
-def _advanced_predict_yearly_with_future_features(
-    points: List[Dict[str, Any]],
-    feature_cols: List[str],
-    horizon_years: int,
-    future_features: Dict[str, float],
-) -> List[Dict[str, Any]]:
-    w, dates, X_feat, t = _advanced_fit(points, feature_cols, scale_used="yearly")
-    X_time = _time_basis(t, periods=[], trend_degree=1)
-    X = np.hstack([X_time, X_feat])
-    y_hat = (X @ w).tolist()
-    last_feats = X_feat[-1, :].copy()
-    for i, col in enumerate(feature_cols):
-        if col in future_features:
-            last_feats[i] = float(future_features[col])
-    ft = np.arange(len(t), len(t) + horizon_years, dtype=float)
-    Xf_time = _time_basis(ft, periods=[], trend_degree=1)
-    Xf_feat = np.tile(last_feats, (horizon_years, 1))
-    Xf = np.hstack([Xf_time, Xf_feat])
-    future_y = (Xf @ w).tolist()
-    last_date = dates[-1]
-    future_dates = [_year_add(last_date, i) for i in range(1, horizon_years + 1)]
-    out: List[Dict[str, Any]] = []
-    for i, d in enumerate(dates):
-        out.append({"date": d, "value": float(y_hat[i]), "kind": "fitted"})
-    for i in range(horizon_years):
-        out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
-    return out
-
-
-def _advanced_predict_daily_with_future_features(
-    points: List[Dict[str, Any]],
-    feature_cols: List[str],
-    horizon_days: int,
-    future_features: Dict[str, float],
-) -> List[Dict[str, Any]]:
-    w, dates, X_feat, t = _advanced_fit(points, feature_cols, scale_used="daily")
-    X_time = _time_basis(t, periods=[7.0, 30.0, 365.25], trend_degree=1)
-    X = np.hstack([X_time, X_feat])
-    y_hat = (X @ w).tolist()
-    last_feats = X_feat[-1, :].copy()
-    for i, col in enumerate(feature_cols):
-        if col in future_features:
-            last_feats[i] = float(future_features[col])
-    ft = np.arange(len(t), len(t) + horizon_days, dtype=float)
-    Xf_time = _time_basis(ft, periods=[7.0, 30.0, 365.25], trend_degree=1)
-    Xf_feat = np.tile(last_feats, (horizon_days, 1))
-    Xf = np.hstack([Xf_time, Xf_feat])
-    future_y = (Xf @ w).tolist()
-    last_date = dates[-1]
-    future_dates = [_day_add(last_date, i) for i in range(1, horizon_days + 1)]
-    out: List[Dict[str, Any]] = []
-    for i, d in enumerate(dates):
-        out.append({"date": d, "value": float(y_hat[i]), "kind": "fitted"})
-    for i in range(horizon_days):
+    for i in range(min(n_train, n)):
+        out.append({"date": dates[i], "value": float(y_hat_all[i]), "kind": "fit_pred"})
+    for i in range(n_train, n):
+        out.append({"date": dates[i], "value": float(y_hat_all[i]), "kind": "test_pred"})
+    for i in range(horizon_steps):
         out.append({"date": future_dates[i], "value": float(future_y[i]), "kind": "forecast"})
     return out
 
@@ -417,20 +406,6 @@ def _build_delta_series(baseline: List[Dict[str, Any]], piml: List[Dict[str, Any
         return out
     for b, p in zip(baseline, piml):
         out.append({"date": b["date"], "kind": b.get("kind", ""), "delta": float(p["value"]) - float(b["value"])})
-    return out
-
-
-def _annotate_fit_test_kinds(baseline: List[Dict[str, Any]], *, n_history: int, n_test: int) -> List[Dict[str, Any]]:
-    if not baseline or n_history <= 0 or n_test <= 0:
-        return baseline
-
-    split_idx = max(0, n_history - n_test)
-    out: List[Dict[str, Any]] = []
-    for i, p in enumerate(baseline):
-        kind = p.get("kind", "")
-        if i < n_history:
-            kind = "test_pred" if i >= split_idx else "fit_pred"
-        out.append({"date": p["date"], "value": float(p["value"]), "kind": kind})
     return out
 
 
@@ -530,7 +505,6 @@ def _derive_physics_effective(
     except Exception:
         mcr = 0.20 if scale not in ("daily", "yearly") else (0.08 if scale == "daily" else 0.35)
         mcr_src = "auto_fallback"
-
     if mcr < 0:
         mcr = abs(mcr)
         mcr_src = f"{mcr_src}_abs"
@@ -539,7 +513,6 @@ def _derive_physics_effective(
         mcr_src = f"{mcr_src}_clamped_1.0"
     cap_value = physics_user.get("cap_value", None)
     cap_src = "user" if cap_value is not None else None
-
     need_cap = mode in ("cap", "full")
     if need_cap and cap_value is None:
         ys = [float(v) for v in (history_y or []) if v is not None and np.isfinite(float(v))]
@@ -642,7 +615,6 @@ def list_predictions():
                 .strip()
                 .lower()
             )
-
             outputs = doc.get("outputs") or {}
             orig = outputs.get("original") or {}
             cs = orig.get("correction_summary") or {}
@@ -736,36 +708,6 @@ def create_prediction():
         history_y=history_y,
     )
 
-    # baseline fit/predict
-    try:
-        if scale_used == "monthly":
-            if mode_used == "basic":
-                baseline_original = _basic_predict_monthly(points_sorted, horizon_steps)
-                method = "baseline_basic_timebasis_ridge_monthly"
-            else:
-                baseline_original = _advanced_predict_monthly(points_sorted, feature_cols, horizon_steps)
-                method = "baseline_advanced_ridge_timebasis_monthly"
-        elif scale_used == "daily":
-            if mode_used == "basic":
-                baseline_original = _basic_predict_daily(points_sorted, horizon_steps)
-                method = "baseline_basic_timebasis_ridge_daily"
-            else:
-                baseline_original = _advanced_predict_daily(points_sorted, feature_cols, horizon_steps)
-                method = "baseline_advanced_ridge_timebasis_daily"
-        elif scale_used == "yearly":
-            if mode_used == "basic":
-                baseline_original = _basic_predict_yearly(points_sorted, horizon_steps)
-                method = "baseline_basic_timebasis_ridge_yearly"
-            else:
-                baseline_original = _advanced_predict_yearly(points_sorted, feature_cols, horizon_steps)
-                method = "baseline_advanced_ridge_timebasis_yearly"
-        else:
-            return make_response(jsonify({"error": "Unsupported scale. Use daily, monthly, or yearly data."}), 400)
-    except ValueError as e:
-        return make_response(jsonify({"error": str(e)}), 400)
-    except Exception as e:
-        return make_response(jsonify({"error": "Model fit/predict failed.", "details": str(e)}), 500)
-
     # evaluation
     evaluation_out: Dict[str, Any] | None = None
     n_test = 0
@@ -788,7 +730,53 @@ def create_prediction():
         except Exception as e:
             return make_response(jsonify({"error": "Evaluation failed.", "details": str(e)}), 500)
 
-    baseline_original = _annotate_fit_test_kinds(baseline_original, n_history=n_history, n_test=n_test)
+    n_train = int(max(2, min(n_train, n_history)))
+    n_test = int(max(0, min(n_test, n_history - n_train)))
+
+    # baseline fit/predict
+    try:
+        if scale_used == "monthly":
+            if mode_used == "basic":
+                baseline_original = _basic_fit_predict_monthly(points_sorted, n_train, n_test, horizon_steps)
+                method = "baseline_basic_timebasis_ridge_monthly"
+            else:
+                baseline_original = _advanced_fit_predict(
+                    points_sorted, feature_cols,
+                    scale_used="monthly",
+                    n_train=n_train,
+                    horizon_steps=horizon_steps,
+                )
+                method = "baseline_advanced_ridge_timebasis_monthly"
+        elif scale_used == "daily":
+            if mode_used == "basic":
+                baseline_original = _basic_fit_predict_daily(points_sorted, n_train, n_test, horizon_steps)
+                method = "baseline_basic_timebasis_ridge_daily"
+            else:
+                baseline_original = _advanced_fit_predict(
+                    points_sorted, feature_cols,
+                    scale_used="daily",
+                    n_train=n_train,
+                    horizon_steps=horizon_steps,
+                )
+                method = "baseline_advanced_ridge_timebasis_daily"
+        elif scale_used == "yearly":
+            if mode_used == "basic":
+                baseline_original = _basic_fit_predict_yearly(points_sorted, n_train, n_test, horizon_steps)
+                method = "baseline_basic_timebasis_ridge_yearly"
+            else:
+                baseline_original = _advanced_fit_predict(
+                    points_sorted, feature_cols,
+                    scale_used="yearly",
+                    n_train=n_train,
+                    horizon_steps=horizon_steps,
+                )
+                method = "baseline_advanced_ridge_timebasis_yearly"
+        else:
+            return make_response(jsonify({"error": "Unsupported scale. Use daily, monthly, or yearly data."}), 400)
+    except ValueError as e:
+        return make_response(jsonify({"error": str(e)}), 400)
+    except Exception as e:
+        return make_response(jsonify({"error": "Model fit/predict failed.", "details": str(e)}), 500)
 
     # physics correction
     try:
@@ -831,6 +819,9 @@ def create_prediction():
         "horizon_unit": horizon_unit,
     }
 
+    # KPI only on TEST
+    kpi_test_original_base = _compute_test_kpi(observed, baseline_original, n_history=n_history, n_test=n_test)
+    kpi_test_original_piml = _compute_test_kpi(observed, piml_original, n_history=n_history, n_test=n_test)
     outputs: Dict[str, Any] = {
         "observed": observed,
         "original": {
@@ -845,6 +836,10 @@ def create_prediction():
             "physics_effective": physics_effective,
             "physics_sources": physics_sources,
             "why_no_correction": why_no_original,
+            "kpi_test": {
+                "baseline": kpi_test_original_base,
+                "piml": kpi_test_original_piml,
+            },
         },
     }
 
@@ -852,28 +847,38 @@ def create_prediction():
     disturbance_summary: Dict[str, Any] | None = None
     if disturbance["enabled"]:
         try:
-            observed_disturbed: List[Dict[str, Any]] | None = None
             disturbance_note = (
-                "Disturbed is a what-if scenario. Real observed history is unchanged; the disturbance affects the scenario inputs used to generate baseline and corrected series. "
-                "Accuracy is not scored because there is no ground truth for the disturbed future."
+                "Disturbed is a what-if scenario. Real observed history is unchanged; "
+                "the disturbance affects ONLY test + forecast outputs (basic) or ONLY test + forecast inputs (advanced). "
+                "Accuracy is not scored for forecast because there is no ground truth."
             )
 
+            observed_disturbed_series: List[Dict[str, Any]] | None = None
+            observed_for_kpi = observed
+
             if mode_used == "basic":
-                disturbed_points = apply_basic_disturbance(points_sorted, float(disturbance["global_pct"] or 0.0))
-                observed_disturbed = [{"date": p["date"], "value": float(p["y"]), "kind": "observed_disturbed"} for p in disturbed_points]
+                baseline_disturbed, disturbance_summary = apply_basic_disturbance_to_series(
+                    baseline_original,
+                    float(disturbance["global_pct"] or 0.0),
+                    apply_kinds=("test_pred", "forecast"),
+                )
+                disturbance_summary["enabled"] = True
+                if n_test > 0:
+                    dates = [p.get("date") for p in observed if p.get("date")]
+                    split_idx = max(0, len(dates) - int(n_test))
+                    test_dates = set(dates[split_idx:len(dates)])
+                    observed_disturbed_series = build_basic_observed_whatif_for_dates(
+                        observed,
+                        float(disturbance["global_pct"] or 0.0),
+                        test_dates,
+                    )
+                    m = 1.0 + float(disturbance["global_pct"] or 0.0)
+                    dm = {p["date"]: float(p["value"]) for p in observed_disturbed_series}
+                    observed_for_kpi = [
+                        {"date": p["date"], "value": (dm[p["date"]] if p["date"] in dm else float(p["value"])), "kind": p.get("kind", "observed")}
+                        for p in observed
+                    ]
 
-                if scale_used == "monthly":
-                    baseline_disturbed = _basic_predict_monthly(disturbed_points, horizon_steps)
-                elif scale_used == "daily":
-                    baseline_disturbed = _basic_predict_daily(disturbed_points, horizon_steps)
-                else:
-                    baseline_disturbed = _basic_predict_yearly(disturbed_points, horizon_steps)
-
-                disturbance_summary = {
-                    "enabled": True,
-                    "mode": "basic",
-                    "global_pct": float(disturbance["global_pct"] or 0.0),
-                }
             else:
                 last_feats = points_sorted[-1].get("features", {}) or {}
                 future_feats, disturbance_summary = build_advanced_future_features(
@@ -882,27 +887,17 @@ def create_prediction():
                     feature_pct=disturbance["feature_pct"] or {},
                 )
                 disturbance_summary["enabled"] = True
-
-                disturbance_note = (
-                    "Disturbed is a what-if scenario. Real observed history is unchanged. "
-                    "In advanced mode, disturbance modifies the future feature vector used for forecasting (history observations are not altered). "
-                    "Accuracy is not scored because there is no ground truth for the disturbed future."
+                test_feature_pct = disturbance["feature_pct"] or {}
+                baseline_disturbed = _advanced_fit_predict(
+                    points_sorted,
+                    feature_cols,
+                    scale_used=scale_used,
+                    n_train=n_train,
+                    horizon_steps=horizon_steps,
+                    future_features=future_feats,
+                    test_feature_pct=test_feature_pct,
                 )
 
-                if scale_used == "monthly":
-                    baseline_disturbed = _advanced_predict_monthly_with_future_features(
-                        points_sorted, feature_cols, horizon_steps, future_features=future_feats
-                    )
-                elif scale_used == "daily":
-                    baseline_disturbed = _advanced_predict_daily_with_future_features(
-                        points_sorted, feature_cols, horizon_steps, future_features=future_feats
-                    )
-                else:
-                    baseline_disturbed = _advanced_predict_yearly_with_future_features(
-                        points_sorted, feature_cols, horizon_steps, future_features=future_feats
-                    )
-
-            baseline_disturbed = _annotate_fit_test_kinds(baseline_disturbed, n_history=n_history, n_test=n_test)
             piml_disturbed, correction_disturbed, comparison_disturbed, delta_disturbed, why_no_disturbed = _run_physics(
                 baseline_disturbed, physics_effective
             )
@@ -926,7 +921,11 @@ def create_prediction():
                 ),
             }
 
-            out_disturbed: Dict[str, Any] = {
+            # KPI only on TEST
+            kpi_test_dist_base = _compute_test_kpi(observed_for_kpi, baseline_disturbed, n_history=n_history, n_test=n_test)
+            kpi_test_dist_piml = _compute_test_kpi(observed_for_kpi, piml_disturbed, n_history=n_history, n_test=n_test)
+
+            outputs["disturbed"] = {
                 "meta": meta,
                 "baseline": baseline_disturbed,
                 "piml": piml_disturbed,
@@ -939,11 +938,14 @@ def create_prediction():
                 "physics_sources": physics_sources,
                 "why_no_correction": why_no_disturbed,
                 "disturbance_note": disturbance_note,
+                "kpi_test": {
+                    "baseline": kpi_test_dist_base,
+                    "piml": kpi_test_dist_piml,
+                },
             }
-            if observed_disturbed is not None:
-                out_disturbed["observed_disturbed"] = observed_disturbed
 
-            outputs["disturbed"] = out_disturbed
+            if observed_disturbed_series is not None:
+                outputs["disturbed"]["observed_disturbed"] = observed_disturbed_series
 
         except ValueError as e:
             return make_response(jsonify({"error": str(e)}), 400)
@@ -974,9 +976,9 @@ def create_prediction():
         "disturbance_summary": disturbance_summary,
         "limitations": [
             "Horizon uses months for monthly data, days for daily data, and years for yearly data (API field name kept for compatibility).",
-            "Advanced baseline uses last feature vector for forecasting; disturbance applies to the future feature vector.",
-            "PIML is implemented as a post-processing correction layer (no retraining).",
-            "Disturbed scenarios are for what-if comparison, not accuracy scoring (no ground truth).",
+            "Training is always ridge regression; physics never participates in training; disturbance never retrains.",
+            "Physics correction is post-processing and affects ONLY test_pred + forecast (fit_pred is never corrected).",
+            "KPI is computed ONLY on test segment; forecast is never included in KPI.",
         ],
     }
 
