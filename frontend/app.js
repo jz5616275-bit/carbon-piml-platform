@@ -371,10 +371,10 @@ async function fetchRecentPredictions(limit = 5) {
 }
 
 function fmtShortDate(iso) {
-  if (!iso) return "—";
+  if (!iso) return "-";
   try {
-    const s = String(iso);
-    return s.replace("T", " ").slice(0, 16);
+    const d = new Date(iso);
+    return d.toISOString().split("T")[0];
   } catch {
     return String(iso);
   }
@@ -931,7 +931,7 @@ function drawViolations(canvas, violSeries) {
   const pad = { l: 110, r: 16, t: 18, b: 26 };
   const innerW = w - pad.l - pad.r;
   const innerH = h - pad.t - pad.b;
-  const rules = ["non_negative", "cap", "rate_limit", "spike_clip"];
+  const rules = ["non_negative", "cap", "rate_limit"];
   const rows = rules.length;
   const dates = (violSeries || []).map((p) => p.date).sort();
   if (!dates.length) {
@@ -1272,7 +1272,7 @@ function drawActiveView() {
     const rules = p.rules_hit || [];
     for (const r of rules) byRule[r] = (byRule[r] || 0) + 1;
   }
-  const parts = ["non_negative", "cap", "rate_limit", "spike_clip"].map((r) => `${r} ${byRule[r] || 0}`);
+  const parts = ["non_negative", "cap", "rate_limit"].map((r) => `${r} ${byRule[r] || 0}`);
   setText("kpiPhys", `B vs P shown by rule hits: ${parts.join(", ")}`);
   const cs = block.correction_summary || {};
   const numAdj = (cs.num_adjusted ?? cs.n_adjusted_points);

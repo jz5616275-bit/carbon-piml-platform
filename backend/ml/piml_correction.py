@@ -46,17 +46,19 @@ def apply_physics_corrections(
     use_nonneg = non_negative and mode in ("non_negative", "cap", "smoothness", "full")
     use_cap = cap_value is not None and mode in ("cap", "full")
     use_rate = mode in ("smoothness", "full")
-    corrected = []
-    adjustments = []
-    by_rule = {}
-    violations_series = []
+    corrected: List[Dict[str, Any]] = []
+    adjustments: List[Dict[str, Any]] = []
+    by_rule: Dict[str, int] = {}
+    violations_series: List[Dict[str, Any]] = []
     prev = float(prev_value) if prev_value is not None else None
+
     for p in series:
         d = p["date"]
         kind = p.get("kind", "")
         y0 = _safe_float(p["value"])
         y = float(y0)
-        rules_hit = []
+        rules_hit: List[str] = []
+
         if _is_target_kind(kind, a2):
 
             # non-negative
@@ -73,7 +75,7 @@ def apply_physics_corrections(
                 adjustments.append({"date": d, "rule": "cap", "from": y, "to": float(cap_value)})
                 y = float(cap_value)
 
-            # smoothness
+            # smoothness (rate limit)
             if use_rate and prev is not None and max_change_rate > 0:
                 base = abs(prev) if abs(prev) > 1e-9 else 1.0
                 allowed = max_change_rate * base
@@ -95,6 +97,7 @@ def apply_physics_corrections(
     changed = len({a["date"] for a in adjustments})
     denom = max(1, len([p for p in series if _is_target_kind(p.get("kind", ""), a2)]))
     ratio = changed / denom if denom else 0.0
+    by_rule.pop("spike_clip", None)
     summary = {
         "num_adjusted": len(adjustments),
         "max_abs_adjustment": float(max_abs),
