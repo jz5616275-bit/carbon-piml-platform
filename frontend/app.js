@@ -663,9 +663,7 @@ function readPhysics() {
   else if (smooth) physicsMode = "smoothness";
   else if (nonNeg) physicsMode = "non_negative";
 
-  // Apply-to is fixed to test_forecast (UI removed)
   const applyTo = "test_forecast";
-
   const capRaw = el("capValue")?.value;
   const capValue = capRaw === "" ? null : Number(capRaw);
   const physics = {
@@ -1044,7 +1042,6 @@ function exportCsv() {
 /* Results rendering */
 function setActiveTab(tab) {
   state.activeTab = tab;
-
   const tabCompare = el("tabCompare");
   const tabDelta = el("tabDelta");
   const tabViol = el("tabViol");
@@ -1093,7 +1090,6 @@ function _toValueMap(series) {
 function _computeKpiTest(observed, predSeries, segSets) {
   const obsTest = filterSeriesBySegment(observed || [], "test", segSets);
   const predTest = filterSeriesBySegment(predSeries || [], "test", segSets);
-
   const om = _toValueMap(obsTest);
   const pm = _toValueMap(predTest);
 
@@ -1139,8 +1135,6 @@ function renderResults(doc) {
     || "test_forecast";
   setText("applyToBox", applyTo);
   setText("rawBox", jsonPretty(doc));
-
-  // KPI is updated in drawActiveView() so it can change with view (original/disturbed).
   setText("kpiBaseErr", "—");
   setText("kpiPimlErr", "—");
   setText("kpiImprove", "—");
@@ -1245,7 +1239,6 @@ function drawActiveView() {
   const kpi = block.kpi_test || {};
   const kb = kpi.baseline || {};
   const kp = kpi.piml || {};
-
   const hasBase = (kb.rmse !== null && kb.rmse !== undefined);
   const hasPiml = (kp.rmse !== null && kp.rmse !== undefined);
 
@@ -1304,7 +1297,6 @@ function drawActiveView() {
     const physMode = _getPhysMode(state.lastResponse);
     const backendSaysNoAdj = (numAdj !== null && numAdj !== undefined) ? (Number(numAdj) <= 0) : false;
     const backendModeNone = physMode === "none";
-
     let pimlToPlot = pimlSegRaw.map((p) => ({ ...p, value: p.value }));
     if (SHOW_PIML_ONLY_WHEN_DIFF) {
       pimlToPlot = _maskedPimlSeries(pimlToPlot, baseSeg, PLOT_EPS);
@@ -1324,7 +1316,6 @@ function drawActiveView() {
   if (state.activeTab === "delta") {
     const deltaSeg = filterSeriesBySegment(block.delta_series || [], state.activeSegment, segSets);
     drawDelta(el("deltaChart"), deltaSeg.map((p) => ({ date: p.date, value: p.delta, kind: p.kind })));
-
     setText("deltaNum", cs.num_adjusted ?? "—");
     setText("deltaMax", cs.max_abs_adjustment !== undefined ? fmtNum(cs.max_abs_adjustment) : "—");
     setText("deltaMean", cs.mean_abs_adjustment !== undefined ? fmtNum(cs.mean_abs_adjustment) : "—");
@@ -1351,10 +1342,8 @@ function initSetupPage() {
   });
   el("smoothStrength")?.addEventListener("change", syncPhysicsUi);
   updatePhysicsUI();
-
   // Recent runs
   refreshRecentRuns();
-
   el("uploadBtn")?.addEventListener("click", async () => {
     if (!state.authed) {
       setStatus("runStatus", "Please login first.", true);
@@ -1381,7 +1370,6 @@ function initSetupPage() {
       state.featureCols = info.featureCols;
       state.modeDetected = info.mode;
       state.scaleUsed = info.scale;
-
       setText("uploadStatus", `Uploaded. ID: ${uploadId}`);
       setText("modeStatus", state.modeDetected);
       setText("scaleStatus", state.scaleUsed);
