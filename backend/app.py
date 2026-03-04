@@ -8,9 +8,7 @@ from backend.api.predictions_api import predictions_blueprint
 
 
 def create_app() -> Flask:
-    # Always load .env from project root
     load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-
     app = Flask(__name__)
     CORS(
         app,
