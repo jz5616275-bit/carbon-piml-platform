@@ -1,23 +1,93 @@
-# Carbon PIML Platform (Frontend)
+# Carbon PIML Platform
 
-This folder is a simple 2-page frontend:
-- Setup: upload CSV + choose scenario + run
-- Results: key numbers + chart + export
+This project demonstrates a small platform for carbon emission forecasting using a combination of machine learning and simple physics-based constraints.
 
-## How to run
-1) Start backend
+Users can upload a dataset, generate a baseline prediction, apply physics-informed corrections, simulate disturbance scenarios, and view the results through charts.
 
-2) Open frontend
-- Just open `frontend/index.html` in a browser
 
-If CORS blocks requests:
-- Ensure backend CORS is enabled in `backend/app.py`
-- Use a simple static server (recommended):
-  - VSCode Live Server, or
-  - `python -m http.server` in project root, then open `/frontend/index.html`
+## Project Structure
+
+backend  
+- API endpoints and backend logic  
+- prediction pipeline and physics correction  
+- data validation utilities  
+
+frontend  
+- index.html – upload dataset and configure prediction  
+- results.html – display results and charts  
+- app.js – frontend interaction logic  
+
+
+## Technology Stack
+
+Backend  
+- Python  
+- Flask  
+- MongoDB  
+
+Frontend  
+- HTML  
+- CSS  
+- JavaScript  
+
+Authentication  
+- Auth0
+
+
+## Running the Project
+
+### Option 1 (Recommended)
+
+Run the provided script:
+
+```powershell
+run_local.ps1
+```
+
+This will start the backend server.
+
+
+### Option 2 (Manual Run)
+
+Start the backend:
+
+```bash
+cd backend
+pip install -r requirements.txt
+python app.py
+```
+
+Open the frontend page in your browser:
+
+```
+frontend/index.html
+```
+
+If the browser blocks requests due to CORS, run a simple static server:
+
+```bash
+python -m http.server
+```
+
+Then open:
+
+```
+http://localhost:8000/frontend/index.html
+```
+
 
 ## Notes
 
-- Disturbance sliders are percent-based. The payload sends decimals (e.g. 10% -> 0.10).
-- Evaluation is "history holdout". Disturbance is what-if only (no ground truth).
-- Login is a demo stub (Level 1). It only changes UI state.
+- Disturbance sliders use percentages (for example 10% → 0.10).
+- Evaluation uses a history holdout split.
+- Disturbance is used for scenario analysis rather than ground truth evaluation.
+- Login is a demo stub that only affects the UI state.
+
+
+## Main Features
+
+- Dataset upload  
+- Baseline emission prediction  
+- Physics-informed correction  
+- Disturbance scenario simulation  
+- Result visualization

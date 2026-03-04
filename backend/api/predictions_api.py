@@ -199,7 +199,7 @@ def _basic_fit_predict_daily(points: List[Dict[str, Any]], n_train: int, n_test:
             out.append({"date": future_dates[i], "value": float(forecast[i]), "kind": "forecast"})
         return out
 
-    # Build training design
+
     idx = np.arange(max_lag, n_train, dtype=int)
     t = idx.astype(float)
     t0 = float(max_lag)
@@ -843,7 +843,7 @@ def create_prediction():
         },
     }
 
-    # disturbance branch
+    # disturbance
     disturbance_summary: Dict[str, Any] | None = None
     if disturbance["enabled"]:
         try:
